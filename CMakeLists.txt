@@ -121,14 +121,20 @@ target_compile_options(wavsen_audio PRIVATE
 
 target_sources(wavsen_audio
     PUBLIC FILE_SET CXX_MODULES FILES
-        src/audio/sound_manager.cppm
+        src/audio/byte_stream.cppm
         src/audio/cubeb_device.cppm
+        src/audio/sound_manager.cppm
         src/audio/stream_decoder.cppm
+        src/audio/av_player.cppm
+        # aggregator must come last (depends on the four above)
+        src/audio/audio.cppm
 )
 target_sources(wavsen_audio PRIVATE
+    src/audio/byte_stream.cpp
     src/audio/cubeb_device.cpp
     src/audio/stream_decoder.cpp
     src/audio/sound_manager.cpp
+    src/audio/av_player.cpp
 )
 
 target_link_libraries(wavsen_audio

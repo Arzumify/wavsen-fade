@@ -1,21 +1,9 @@
-export module wavsen.audio;
+export module wavsen.audio.mixer;
 
 import rstd.cppstd;
+import wavsen.audio.byte_stream;  // IByteStream (re-exported via wavsen.audio aggregator)
 
 export namespace wavsen::audio {
-
-// Minimal byte-stream interface decoupled from any project's VFS. Adapters
-// exist in OWE (IBinaryStream → IByteStream); future Qcm consumers can
-// implement directly.
-class IByteStream {
-public:
-    enum class Origin : std::int32_t { Begin = 0, Current = 1, End = 2 };
-
-    virtual ~IByteStream() = default;
-
-    virtual auto read(void* dst, std::size_t bytes) -> std::size_t = 0;
-    virtual auto seek(std::int64_t offset, Origin origin) -> bool  = 0;
-};
 
 // A mountable PCM source. Data callback fills `frames` interleaved frames
 // of the device's negotiated format (f32 little-endian) and channel count.
@@ -40,11 +28,6 @@ public:
     virtual void set_position(float /*x*/, float /*y*/, float /*z*/) {}
     virtual void set_listener_position(float /*x*/, float /*y*/, float /*z*/) {}
 };
-
-// Construct a libav*-backed SoundStream from a byte source. Decodes any
-// container/codec libavformat understands and resamples to `desc`.
-auto make_stream(std::shared_ptr<IByteStream> source, const SoundStream::Desc& desc)
-    -> std::unique_ptr<SoundStream>;
 
 // Owns the cubeb output device and mounted streams. Mixing happens in the
 // audio thread via cubeb's data callback. Mute / volume are atomic so UI

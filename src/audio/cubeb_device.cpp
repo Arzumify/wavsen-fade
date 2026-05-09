@@ -1,11 +1,11 @@
-module wavsen.audio.cubeb;
+module wavsen.audio.core;
 
 import rstd.cppstd;
 import rstd;
 import rstd.log;
 import cubeb;
 
-namespace wavsen::audio::detail {
+namespace wavsen::audio {
 
 CubebDevice::CubebDevice() = default;
 
@@ -99,6 +99,15 @@ void CubebDevice::unmount_all() {
     channels_.clear();
 }
 
+std::uint64_t CubebDevice::stream_position_frames() const {
+    if (!stream_) return 0;
+    std::uint64_t pos = 0;
+    if (cubeb_stream_get_position(stream_, &pos) != CUBEB_OK) {
+        return 0;
+    }
+    return pos;
+}
+
 long CubebDevice::data_cb(::cubeb_stream*, void* user, const void* /*in*/,
                           void* output_buffer, long nframes) {
     auto* self = static_cast<CubebDevice*>(user);
@@ -142,4 +151,4 @@ void CubebDevice::state_cb(::cubeb_stream*, void* /*user*/, ::cubeb_state state)
     }
 }
 
-} // namespace wavsen::audio::detail
+} // namespace wavsen::audio

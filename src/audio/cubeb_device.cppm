@@ -1,9 +1,9 @@
-export module wavsen.audio.cubeb;
+export module wavsen.audio.core;
 
 import rstd.cppstd;
 import cubeb;
 
-export namespace wavsen::audio::detail {
+export namespace wavsen::audio {
 
 // Negotiated stream format — wavsen always asks cubeb for f32 interleaved.
 struct DeviceDesc {
@@ -45,6 +45,11 @@ public:
 
     auto desc() const -> DeviceDesc { return desc_; }
 
+    // Frames the audio device has actually played back since the cubeb
+    // stream was created. Used by AvPlayer as the master clock for A/V
+    // sync. Returns 0 before init() / on failure.
+    auto stream_position_frames() const -> std::uint64_t;
+
 private:
     static long data_cb(::cubeb_stream*, void* user, const void* in, void* out, long nframes);
     static void state_cb(::cubeb_stream*, void* user, ::cubeb_state state);
@@ -60,4 +65,4 @@ private:
     std::atomic<bool>  muted_ { false };
 };
 
-} // namespace wavsen::audio::detail
+} // namespace wavsen::audio

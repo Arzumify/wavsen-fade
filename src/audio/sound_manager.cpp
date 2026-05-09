@@ -1,35 +1,16 @@
-module wavsen.audio;
+module wavsen.audio.mixer;
 
 import rstd.cppstd;
 import rstd;
 import rstd.log;
-import wavsen.audio.cubeb;
-import wavsen.audio.stream_decoder;
+import wavsen.audio.core;
 
 namespace wavsen::audio {
 
 namespace {
 
-// SoundStream backed by libav* decoder. Created via make_stream(); the
-// CubebDevice pulls PCM through next_pcm in the audio thread.
-class DecoderStream : public SoundStream {
-public:
-    explicit DecoderStream(detail::StreamDecoder dec)
-        : dec_(std::move(dec)) {}
-
-    auto next_pcm(void* dst, std::uint32_t frames) -> std::uint64_t override {
-        return dec_.next_pcm(dst, frames);
-    }
-    void pass_desc(const Desc& d) override {
-        dec_.retarget({ d.channels, d.sample_rate });
-    }
-
-private:
-    detail::StreamDecoder dec_;
-};
-
 // Adapter exposing a SoundStream to CubebDevice's IPullChannel interface.
-class StreamPullChannel : public detail::IPullChannel {
+class StreamPullChannel : public IPullChannel {
 public:
     explicit StreamPullChannel(std::unique_ptr<SoundStream> ss)
         : ss_(std::move(ss)) {}
@@ -37,7 +18,7 @@ public:
     auto next_pcm(void* dst, std::uint32_t frames) -> std::uint64_t override {
         return ss_->next_pcm(dst, frames);
     }
-    void pass_desc(const detail::DeviceDesc& d) override {
+    void pass_desc(const DeviceDesc& d) override {
         ss_->pass_desc({ d.channels, d.sample_rate });
     }
 
@@ -47,18 +28,9 @@ private:
 
 } // namespace
 
-auto make_stream(std::shared_ptr<IByteStream> source, const SoundStream::Desc& desc)
-    -> std::unique_ptr<SoundStream> {
-    detail::StreamDecoder dec;
-    if (!dec.open(std::move(source), { desc.channels, desc.sample_rate })) {
-        return nullptr;
-    }
-    return std::make_unique<DecoderStream>(std::move(dec));
-}
-
 class SoundManager::Impl {
 public:
-    detail::CubebDevice device;
+    CubebDevice device;
 };
 
 SoundManager::SoundManager() : impl_(std::make_unique<Impl>()) {}

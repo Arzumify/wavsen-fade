@@ -2,39 +2,46 @@ module;
 
 #include <cstdio>  // SEEK_SET / SEEK_CUR macros (preprocessor-only, can't be modulised)
 
-module wavsen.audio.stream_decoder;
+module wavsen.audio.file;
 
 import rstd.cppstd;
 import rstd;
 import rstd.log;
-import wavsen.audio;        // IByteStream
-import wavsen.audio.cubeb;  // DeviceDesc
+import wavsen.audio.byte_stream;  // IByteStream
+import wavsen.audio.core;         // DeviceDesc
+import wavsen.audio.mixer;        // SoundStream
 import avutil;
 import avcodec;
 import avformat;
 import swresample;
 
-namespace wavsen::audio::detail {
+namespace wavsen::audio {
 
 namespace {
 
 constexpr std::size_t kAvioBuf = 32 * 1024;
 
 int avio_read_cb(void* opaque, std::uint8_t* buf, int sz) {
-    auto* s    = static_cast<IByteStream*>(opaque);
-    auto  read = s->read(buf, static_cast<std::size_t>(sz));
-    if (read == 0) return AVERROR_EOF;
-    return static_cast<int>(read);
+    auto* s = static_cast<IByteStream*>(opaque);
+    auto  r = s->read(reinterpret_cast<rstd::u8*>(buf),
+                      static_cast<rstd::usize>(sz));
+    if (r.is_err()) return AVERROR_EOF;
+    auto n = std::move(r).unwrap();
+    if (n == 0) return AVERROR_EOF;
+    return static_cast<int>(n);
 }
 
 std::int64_t avio_seek_cb(void* opaque, std::int64_t off, int whence) {
     auto* s = static_cast<IByteStream*>(opaque);
     if (whence == AVSEEK_SIZE) return -1;
-    auto origin = (whence == SEEK_SET)
-                  ? IByteStream::Origin::Begin
-                  : (whence == SEEK_CUR ? IByteStream::Origin::Current
-                                        : IByteStream::Origin::End);
-    return s->seek(off, origin) ? 0 : -1;
+    rstd::io::SeekFrom from = (whence == SEEK_SET)
+        ? rstd::io::SeekFrom::from_start(static_cast<rstd::u64>(off))
+        : (whence == SEEK_CUR
+            ? rstd::io::SeekFrom::from_current(off)
+            : rstd::io::SeekFrom::from_end(off));
+    auto r = s->seek(from);
+    if (r.is_err()) return -1;
+    return static_cast<std::int64_t>(std::move(r).unwrap());
 }
 
 } // namespace
@@ -181,11 +188,51 @@ public:
         return produced;
     }
 
+    bool seek_to(double seconds) {
+        if (!fmt_ctx_ || stream_idx_ < 0) return false;
+        const AVStream* st = fmt_ctx_->streams[stream_idx_];
+        const auto      tb = st->time_base;
+        const auto      ts = static_cast<std::int64_t>(seconds / ffi::av_q2d(tb));
+        if (av_seek_frame(fmt_ctx_, stream_idx_, ts, AVSEEK_FLAG_BACKWARD) < 0) {
+            rstd::log::warn("wavsen::audio: av_seek_frame failed");
+            return false;
+        }
+        if (cctx_) avcodec_flush_buffers(cctx_);
+        if (swr_)  swr_free(&swr_);
+        setup_resampler();
+        pending_offset_   = 0;
+        pending_frames_   = 0;
+        eof_              = false;
+        last_pts_seconds_ = seconds;
+        return true;
+    }
+
+    double current_pts_seconds() const { return last_pts_seconds_; }
+    bool   is_eof()              const { return eof_; }
+
+    std::uint32_t sample_rate() const {
+        return cctx_ ? static_cast<std::uint32_t>(cctx_->sample_rate) : 0;
+    }
+    std::uint32_t channels() const {
+        return cctx_ ? static_cast<std::uint32_t>(cctx_->ch_layout.nb_channels) : 0;
+    }
+
 private:
     bool pull_decoded_frame() {
         for (;;) {
             int rc = avcodec_receive_frame(cctx_, frame_);
-            if (rc == 0) return true;
+            if (rc == 0) {
+                // Capture PTS of the freshly decoded frame for clock query.
+                const auto pts = (frame_->best_effort_timestamp != AV_NOPTS_VALUE)
+                                 ? frame_->best_effort_timestamp
+                                 : frame_->pts;
+                if (pts != AV_NOPTS_VALUE && fmt_ctx_ && stream_idx_ >= 0) {
+                    last_pts_seconds_ =
+                        static_cast<double>(pts) *
+                        ffi::av_q2d(fmt_ctx_->streams[stream_idx_]->time_base);
+                }
+                return true;
+            }
             if (rc == AVERROR(EAGAIN)) {
                 // Need more input.
                 rc = av_read_frame(fmt_ctx_, pkt_);
@@ -262,9 +309,10 @@ private:
         }
         avio_buf_ = nullptr;
         src_.reset();
-        pending_offset_ = 0;
-        pending_frames_ = 0;
-        eof_           = false;
+        pending_offset_   = 0;
+        pending_frames_   = 0;
+        eof_              = false;
+        last_pts_seconds_ = 0.0;
     }
 
     std::shared_ptr<IByteStream> src_;
@@ -283,6 +331,7 @@ private:
     std::uint32_t             pending_offset_ = 0;
     std::uint32_t             pending_frames_ = 0;
     bool                      eof_            = false;
+    double                    last_pts_seconds_ = 0.0;
 };
 
 StreamDecoder::StreamDecoder() : impl_(std::make_unique<Impl>()) {}
@@ -302,4 +351,41 @@ std::uint64_t StreamDecoder::next_pcm(void* dst, std::uint32_t frames) {
     return impl_->next_pcm(dst, frames);
 }
 
-} // namespace wavsen::audio::detail
+bool          StreamDecoder::seek_to(double s)             { return impl_->seek_to(s); }
+double        StreamDecoder::current_pts_seconds() const   { return impl_->current_pts_seconds(); }
+bool          StreamDecoder::is_eof() const                { return impl_->is_eof(); }
+std::uint32_t StreamDecoder::sample_rate() const           { return impl_->sample_rate(); }
+std::uint32_t StreamDecoder::channels()    const           { return impl_->channels(); }
+
+namespace {
+
+// SoundStream backed by libav* decoder. Created via make_stream(); the
+// CubebDevice pulls PCM through next_pcm in the audio thread.
+class DecoderStream : public SoundStream {
+public:
+    explicit DecoderStream(StreamDecoder dec)
+        : dec_(std::move(dec)) {}
+
+    auto next_pcm(void* dst, std::uint32_t frames) -> std::uint64_t override {
+        return dec_.next_pcm(dst, frames);
+    }
+    void pass_desc(const Desc& d) override {
+        dec_.retarget({ d.channels, d.sample_rate });
+    }
+
+private:
+    StreamDecoder dec_;
+};
+
+} // namespace
+
+auto make_stream(std::shared_ptr<IByteStream> source, const SoundStream::Desc& desc)
+    -> std::unique_ptr<SoundStream> {
+    StreamDecoder dec;
+    if (!dec.open(std::move(source), { desc.channels, desc.sample_rate })) {
+        return nullptr;
+    }
+    return std::make_unique<DecoderStream>(std::move(dec));
+}
+
+} // namespace wavsen::audio
