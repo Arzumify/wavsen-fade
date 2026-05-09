@@ -10,7 +10,11 @@ extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_drm.h>
 #include <libavutil/hwcontext_vulkan.h>
+#if defined(WAVSEN_HAS_VAAPI)
+#include <libavutil/hwcontext_vaapi.h>
+#endif
 #include <libavutil/imgutils.h>
 #include <libavutil/mem.h>
 #include <libavutil/opt.h>
@@ -72,6 +76,16 @@ using ::AVHWFramesContext;
 using ::AVVulkanDeviceContext;
 using ::AVVulkanDeviceQueueFamily;
 using ::AVVkFrame;
+#if defined(WAVSEN_HAS_VAAPI)
+using ::AVVAAPIDeviceContext;
+using ::AVVAAPIFramesContext;
+#endif
+using ::AVDRMObjectDescriptor;
+using ::AVDRMPlaneDescriptor;
+using ::AVDRMLayerDescriptor;
+using ::AVDRMFrameDescriptor;
+using ::AVDRMDeviceContext;
+inline constexpr int AV_DRM_MAX_PLANES_C = ::AV_DRM_MAX_PLANES;
 
 using ::AVMEDIA_TYPE_UNKNOWN;
 using ::AVMEDIA_TYPE_VIDEO;
@@ -84,6 +98,10 @@ using ::AV_PIX_FMT_RGBA;
 using ::AV_PIX_FMT_NV12;
 using ::AV_PIX_FMT_VULKAN;
 using ::AV_PIX_FMT_YUV420P;
+#if defined(WAVSEN_HAS_VAAPI)
+using ::AV_PIX_FMT_VAAPI;
+#endif
+using ::AV_PIX_FMT_DRM_PRIME;
 
 using ::AVCOL_SPC_BT709;
 using ::AVCOL_SPC_BT2020_CL;
@@ -94,6 +112,15 @@ using ::AVCOL_RANGE_JPEG;
 using ::AVCOL_RANGE_MPEG;
 
 using ::AV_HWDEVICE_TYPE_VULKAN;
+using ::AV_HWDEVICE_TYPE_DRM;
+#if defined(WAVSEN_HAS_VAAPI)
+using ::AV_HWDEVICE_TYPE_VAAPI;
+#endif
+
+using ::AV_HWFRAME_MAP_READ;
+using ::AV_HWFRAME_MAP_WRITE;
+using ::AV_HWFRAME_MAP_OVERWRITE;
+using ::AV_HWFRAME_MAP_DIRECT;
 
 using ::AV_CHANNEL_ORDER_UNSPEC;
 
@@ -118,6 +145,7 @@ using ::av_hwdevice_ctx_alloc;
 using ::av_hwdevice_ctx_create;
 using ::av_hwdevice_ctx_init;
 using ::av_hwframe_transfer_data;
+using ::av_hwframe_map;
 
 using ::av_get_pix_fmt_name;
 using ::av_pix_fmt_desc_get;

@@ -5,6 +5,10 @@ pkg_check_modules(WAVSEN_AVCODEC     REQUIRED IMPORTED_TARGET libavcodec>=58)
 pkg_check_modules(WAVSEN_AVUTIL      REQUIRED IMPORTED_TARGET libavutil>=56)
 pkg_check_modules(WAVSEN_SWSCALE     REQUIRED IMPORTED_TARGET libswscale>=5)
 pkg_check_modules(WAVSEN_SWRESAMPLE           IMPORTED_TARGET libswresample>=3)
+# Optional: VAAPI hardware decode. Headers + symbols come from libavutil
+# itself; libva pkg-config is presence-checked so the build also succeeds
+# against an FFmpeg compiled without --enable-vaapi.
+pkg_check_modules(WAVSEN_LIBVA                IMPORTED_TARGET libva libva-drm)
 find_package(Vulkan REQUIRED)
 
 

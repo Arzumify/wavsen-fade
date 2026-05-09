@@ -94,6 +94,37 @@ AVPixelFormat get_format_prefer_vulkan(AVCodecContext* cctx,
     return avcodec_default_get_format(cctx, fmts);
 }
 
+#if defined(WAVSEN_HAS_VAAPI)
+/* VAAPI counterpart: prefer AV_PIX_FMT_VAAPI when offered. The codec
+ * bootstraps an internal AVHWFramesContext from the AVHWDeviceContext
+ * we attached to cctx->hw_device_ctx, so we don't pre-allocate frames
+ * either. */
+AVPixelFormat get_format_prefer_vaapi(AVCodecContext* cctx,
+                                      const AVPixelFormat* fmts) {
+    for (const AVPixelFormat* p = fmts; *p != AV_PIX_FMT_NONE; ++p) {
+        if (*p == AV_PIX_FMT_VAAPI) return AV_PIX_FMT_VAAPI;
+    }
+    return avcodec_default_get_format(cctx, fmts);
+}
+
+/* Best-effort AV_HWDEVICE_TYPE_VAAPI context. FFmpeg owns the libva
+ * VADisplay; we just hand it a render-node path (or NULL for default).
+ * Returns NULL on any failure with *err populated. */
+AVBufferRef* make_vaapi_hwdevice(const std::string& render_node, Error* err) {
+    AVBufferRef* hwd = nullptr;
+    const char*  dev = render_node.empty() ? nullptr : render_node.c_str();
+    int rc = av_hwdevice_ctx_create(&hwd, AV_HWDEVICE_TYPE_VAAPI, dev, nullptr, 0);
+    if (rc < 0 || !hwd) {
+        fail(err, "av_hwdevice_ctx_create(VAAPI" +
+                  (render_node.empty() ? std::string{} : ", " + render_node) +
+                  "): " + av_err_str(rc));
+        if (hwd) av_buffer_unref(&hwd);
+        return nullptr;
+    }
+    return hwd;
+}
+#endif
+
 /* Build an AV_HWDEVICE_TYPE_VULKAN context wrapping the caller's
  * Producer-owned VkInstance/VkDevice. Returns a populated AVBufferRef
  * on success, or null + populated *err on any failure. */
@@ -160,9 +191,12 @@ struct VideoDecoder::State {
     /* Sw landing frame for vulkan→sw downloads via
      * av_hwframe_transfer_data. Allocated lazily on first hw frame. */
     FramePtr      sw_frame;
+    /* DRM_PRIME mapping target frame; allocated lazily for the VAAPI
+     * zero-copy path. Holds the dup'd dma-buf fds via av_hwframe_map. */
+    FramePtr      drm_frame;
     SwsPtr        sws;
-    /* AV_HWDEVICE_TYPE_VULKAN context owned by the codec when present.
-     * Best-effort: a NULL `hwd` here just means we run sw decode. */
+    /* Hwdevice context owned by the codec when present. Best-effort: a
+     * NULL `hwd` here just means we run sw decode. */
     BufRefPtr     hwd;
     AVPixelFormat sws_src_fmt { AV_PIX_FMT_NONE };
     int           sws_src_w   { 0 };
@@ -252,29 +286,63 @@ auto VideoDecoder::open(const std::string& path,
     -> rstd::Result<std::unique_ptr<VideoDecoder>, Error> {
     Error err;
     auto  p = build_internal(path, target_w, target_h, loop,
-                             /*pre_built_hwdev=*/nullptr, &err);
+                             /*pre_built_hwdev=*/nullptr,
+                             /*requested_kind=*/FrameKind::Sw, &err);
     if (!p) return rstd::Err(std::move(err));
     return rstd::Ok(std::move(p));
 }
 
 auto VideoDecoder::open_with_vk(const std::string& path,
                                 uint32_t target_w, uint32_t target_h, bool loop,
-                                const Producer& vk)
+                                const Producer& vk,
+                                const OpenOpts& opts)
     -> rstd::Result<std::unique_ptr<VideoDecoder>, Error> {
-    Error        err;
-    Error        local_err;
-    AVBufferRef* hwd = make_shared_vulkan_hwdevice(vk, &local_err);
-    if (!hwd) {
-        rstd::log::warn(
-            "VideoDecoder: shared-device vulkan setup failed: {} — falling "
-            "back to FFmpeg-managed hwdevice.",
-            local_err.message.c_str());
-        auto p = build_internal(path, target_w, target_h, loop,
-                                /*pre_built_hwdev=*/nullptr, &err);
-        if (!p) return rstd::Err(std::move(err));
-        return rstd::Ok(std::move(p));
+    /* Resolve trial order. Auto = Vulkan first, then VAAPI; explicit
+     * single-mode skips the others; None goes straight to sw. */
+    HwAccel order[2] = { HwAccel::None, HwAccel::None };
+    int     n_order  = 0;
+    switch (opts.hwaccel) {
+    case HwAccel::Auto:   order[0] = HwAccel::Vulkan; order[1] = HwAccel::Vaapi; n_order = 2; break;
+    case HwAccel::Vulkan: order[0] = HwAccel::Vulkan; n_order = 1; break;
+    case HwAccel::Vaapi:  order[0] = HwAccel::Vaapi;  n_order = 1; break;
+    case HwAccel::None:   n_order = 0; break;
     }
-    auto p = build_internal(path, target_w, target_h, loop, hwd, &err);
+
+    for (int i = 0; i < n_order; ++i) {
+        Error        local_err;
+        AVBufferRef* hwd = nullptr;
+        FrameKind    kind = FrameKind::Sw;
+        if (order[i] == HwAccel::Vulkan) {
+            hwd  = make_shared_vulkan_hwdevice(vk, &local_err);
+            kind = FrameKind::VulkanShared;
+        } else if (order[i] == HwAccel::Vaapi) {
+#if defined(WAVSEN_HAS_VAAPI)
+            hwd  = make_vaapi_hwdevice(opts.render_node, &local_err);
+            kind = FrameKind::VaapiDrm;
+#else
+            local_err.message = "wavsen built without VAAPI support";
+#endif
+        }
+        if (!hwd) {
+            rstd::log::info("VideoDecoder: hwaccel attempt {} skipped: {}",
+                            order[i] == HwAccel::Vulkan ? "vulkan" : "vaapi",
+                            local_err.message.c_str());
+            continue;
+        }
+        Error err;
+        auto  p = build_internal(path, target_w, target_h, loop, hwd, kind, &err);
+        if (p) return rstd::Ok(std::move(p));
+        rstd::log::info("VideoDecoder: hwaccel {} build_internal failed: {} — trying next",
+                        order[i] == HwAccel::Vulkan ? "vulkan" : "vaapi",
+                        err.message.c_str());
+        /* build_internal already unref'd `hwd` on failure via state. */
+    }
+
+    /* Final fallback: pure sw decode. */
+    Error err;
+    auto  p = build_internal(path, target_w, target_h, loop,
+                             /*pre_built_hwdev=*/nullptr,
+                             /*requested_kind=*/FrameKind::Sw, &err);
     if (!p) return rstd::Err(std::move(err));
     return rstd::Ok(std::move(p));
 }
@@ -283,6 +351,7 @@ std::unique_ptr<VideoDecoder>
 VideoDecoder::build_internal(const std::string& path,
                              uint32_t target_w, uint32_t target_h,
                              bool loop, void* pre_built_hwdev_v,
+                             FrameKind requested_kind,
                              Error* err) {
     AVBufferRef* pre_built_hwdev = static_cast<AVBufferRef*>(pre_built_hwdev_v);
     if (target_w == 0 || target_h == 0) {
@@ -299,6 +368,13 @@ VideoDecoder::build_internal(const std::string& path,
     self->target_h_ = target_h;
     self->loop_     = loop;
     self->st_       = std::make_unique<VideoDecoder::State>();
+    /* Provisional; downgraded to Sw below if hwdevice attach fails. */
+    self->kind_     = requested_kind;
+    /* Take ownership of the caller's hwdevice ref immediately so that
+     * any early-return path below (avformat_open_input failure etc.)
+     * unrefs it via state.hwd's deleter rather than leaking. The codec
+     * gets its own ref later. */
+    if (pre_built_hwdev) self->st_->hwd.reset(pre_built_hwdev);
 
     AVFormatContext* raw_fmt = nullptr;
     if (int rc = avformat_open_input(&raw_fmt, path.c_str(), nullptr, nullptr);
@@ -333,36 +409,28 @@ VideoDecoder::build_internal(const std::string& path,
         return nullptr;
     }
 
-    /* Iter 4: best-effort vulkan hwdevice. If FFmpeg was built without
-     * vulkan support or the platform lacks the right driver, the create
-     * call fails and we silently fall back to sw decode (keeping the
-     * Iter 2 path live). When it succeeds, the get_format callback
-     * picks AV_PIX_FMT_VULKAN whenever the codec offers it. The codec
-     * takes a ref on the hwdevice ctx, so we keep our own ref alive
-     * for the codec's lifetime via state.hwd. */
-    {
-        AVBufferRef* hwd = pre_built_hwdev;
-        if (!hwd) {
-            int rc = av_hwdevice_ctx_create(&hwd, AV_HWDEVICE_TYPE_VULKAN,
-                                            nullptr, nullptr, 0);
-            if (rc < 0) hwd = nullptr;
-        }
-        if (hwd) {
-            /* Take ownership; the codec gets its own ref. */
-            self->st_->hwd.reset(hwd);
-            self->st_->cctx->hw_device_ctx = av_buffer_ref(hwd);
-            self->st_->cctx->get_format    = get_format_prefer_vulkan;
+    /* Hand the codec its own ref on the hwdevice the trial loop picked
+     * (if any). Sw mode has hwd == nullptr — codec stays sw. */
+    if (self->st_->hwd) {
+        self->st_->cctx->hw_device_ctx = av_buffer_ref(self->st_->hwd.get());
+        if (requested_kind == FrameKind::VulkanShared) {
+            self->st_->cctx->get_format = get_format_prefer_vulkan;
             rstd::log::info(
-                "VideoDecoder: AV_HWDEVICE_TYPE_VULKAN attached ({} device); "
-                "codec {} will use vulkan decode when supported.",
-                pre_built_hwdev ? "shared" : "FFmpeg-owned",
-                avcodec_get_name(par->codec_id));
-        } else {
-            rstd::log::info(
-                "VideoDecoder: vulkan hwdevice unavailable; "
-                "running sw decode for codec {}.",
+                "VideoDecoder: AV_HWDEVICE_TYPE_VULKAN attached for codec {}.",
                 avcodec_get_name(par->codec_id));
         }
+#if defined(WAVSEN_HAS_VAAPI)
+        else if (requested_kind == FrameKind::VaapiDrm) {
+            self->st_->cctx->get_format = get_format_prefer_vaapi;
+            rstd::log::info(
+                "VideoDecoder: AV_HWDEVICE_TYPE_VAAPI attached for codec {}.",
+                avcodec_get_name(par->codec_id));
+        }
+#endif
+    } else {
+        rstd::log::info(
+            "VideoDecoder: sw decode for codec {}.",
+            avcodec_get_name(par->codec_id));
     }
 
     if (int rc = avcodec_open2(self->st_->cctx.get(), dec, nullptr); rc < 0) {
@@ -374,10 +442,12 @@ VideoDecoder::build_internal(const std::string& path,
      * AVVkFrames (img[0]=Y, img[1]=UV) to match the GPU YUV→RGB
      * shader's R8 + R8G8 sampler bindings. We can't set that flag
      * without bypassing FFmpeg's frame_params bootstrap (see comment
-     * on get_format_prefer_vulkan), so always route through the sw
-     * download path — av_hwframe_transfer_data handles whatever
-     * multi-plane format FFmpeg picked. */
-    self->using_vk_frames_ = false;
+     * on get_format_prefer_vulkan), so the Vulkan-shared path always
+     * downgrades to Sw at frame-pump time. The VAAPI path stays as
+     * VaapiDrm — av_hwframe_map handles modifier negotiation. */
+    if (requested_kind == FrameKind::VulkanShared) {
+        self->kind_ = FrameKind::Sw;
+    }
 
     self->st_->pkt.reset(av_packet_alloc());
     self->st_->src_frame.reset(av_frame_alloc());
@@ -389,7 +459,7 @@ VideoDecoder::build_internal(const std::string& path,
 }
 
 int VideoDecoder::next_vk_frame_(VkFrameView& out, Error* err) {
-    if (!using_vk_frames_) {
+    if (kind_ != FrameKind::VulkanShared) {
         fail(err, "next_vk_frame called on non-shared-device decoder");
         return -1;
     }
@@ -431,6 +501,120 @@ int VideoDecoder::next_vk_frame_(VkFrameView& out, Error* err) {
                     out.bit_depth = 16;
                 }
             }
+            const int64_t pts = (st.src_frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                ? st.src_frame->best_effort_timestamp
+                : st.src_frame->pts;
+            out.pts_seconds = (pts == AV_NOPTS_VALUE)
+                ? -1.0
+                : static_cast<double>(pts) * ffi::av_q2d(st.stream_tb);
+            return 0;
+        }
+        if (rc == AVERROR_EOF) {
+            if (loop_) {
+                if (!seek_to_start(st)) {
+                    fail(err, "loop seek-to-zero failed");
+                    return -1;
+                }
+                continue;
+            }
+            return 1;
+        }
+        if (rc != AVERROR(EAGAIN)) {
+            fail(err, "avcodec_receive_frame: " + av_err_str(rc));
+            return -1;
+        }
+        if (st.flushing) continue;
+
+        rc = av_read_frame(st.fmt.get(), st.pkt.get());
+        if (rc == AVERROR_EOF) {
+            avcodec_send_packet(st.cctx.get(), nullptr);
+            st.flushing = true;
+            continue;
+        }
+        if (rc < 0) {
+            fail(err, "av_read_frame: " + av_err_str(rc));
+            return -1;
+        }
+        if (st.pkt->stream_index != st.video_idx) {
+            av_packet_unref(st.pkt.get());
+            continue;
+        }
+        rc = avcodec_send_packet(st.cctx.get(), st.pkt.get());
+        av_packet_unref(st.pkt.get());
+        if (rc < 0 && rc != AVERROR(EAGAIN)) {
+            fail(err, "avcodec_send_packet: " + av_err_str(rc));
+            return -1;
+        }
+    }
+}
+
+int VideoDecoder::next_drm_frame_(DrmFrameView& out, Error* err) {
+    if (kind_ != FrameKind::VaapiDrm) {
+        fail(err, "next_drm_frame called on non-VAAPI decoder");
+        return -1;
+    }
+    State& st = *st_;
+
+    if (!st.drm_frame) st.drm_frame.reset(av_frame_alloc());
+    if (!st.drm_frame) { fail(err, "av_frame_alloc(drm_frame) failed"); return -1; }
+
+    /* Release prior pull's mapped fds before grabbing the next surface. */
+    av_frame_unref(st.src_frame.get());
+    av_frame_unref(st.drm_frame.get());
+
+    while (true) {
+        int rc = avcodec_receive_frame(st.cctx.get(), st.src_frame.get());
+        if (rc == 0) {
+#if defined(WAVSEN_HAS_VAAPI)
+            if (st.src_frame->format != AV_PIX_FMT_VAAPI) {
+                fail(err, "next_drm_frame: decoder produced non-VAAPI frame");
+                return -1;
+            }
+#else
+            fail(err, "next_drm_frame: VAAPI support not built");
+            return -1;
+#endif
+            st.drm_frame->format = AV_PIX_FMT_DRM_PRIME;
+            int mrc = av_hwframe_map(st.drm_frame.get(), st.src_frame.get(),
+                                     AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT);
+            if (mrc < 0) {
+                fail(err, "av_hwframe_map(DRM_PRIME): " + av_err_str(mrc));
+                return -1;
+            }
+            const auto* desc = reinterpret_cast<const AVDRMFrameDescriptor*>(
+                st.drm_frame->data[0]);
+            if (!desc) {
+                fail(err, "av_hwframe_map: DRM_PRIME descriptor null");
+                return -1;
+            }
+            const int n_obj = desc->nb_objects < 4 ? desc->nb_objects : 4;
+            const int n_lay = desc->nb_layers  < 4 ? desc->nb_layers  : 4;
+            out.object_count = static_cast<uint32_t>(n_obj);
+            for (int i = 0; i < n_obj; ++i) {
+                out.objects[i].fd              = desc->objects[i].fd;
+                out.objects[i].size            = desc->objects[i].size;
+                out.objects[i].format_modifier = desc->objects[i].format_modifier;
+            }
+            out.layer_count = static_cast<uint32_t>(n_lay);
+            for (int li = 0; li < n_lay; ++li) {
+                const auto& la = desc->layers[li];
+                out.layers[li].fourcc      = la.format;
+                const int np = la.nb_planes < 4 ? la.nb_planes : 4;
+                out.layers[li].plane_count = static_cast<uint32_t>(np);
+                for (int p = 0; p < np; ++p) {
+                    out.layers[li].planes[p].object_index =
+                        static_cast<uint32_t>(la.planes[p].object_index);
+                    out.layers[li].planes[p].offset = la.planes[p].offset;
+                    out.layers[li].planes[p].pitch  = la.planes[p].pitch;
+                }
+            }
+            out.width  = static_cast<uint32_t>(st.src_frame->width);
+            out.height = static_cast<uint32_t>(st.src_frame->height);
+            out.colorspace  = map_colorspace(st.src_frame->colorspace);
+            out.color_range = map_range(st.src_frame->color_range);
+            /* VAAPI 8-bit profiles land as NV12; 10-bit as P010. We only
+             * support 8-bit on the DRM_PRIME zero-copy path for now. */
+            out.bit_depth = 8;
             const int64_t pts = (st.src_frame->best_effort_timestamp != AV_NOPTS_VALUE)
                 ? st.src_frame->best_effort_timestamp
                 : st.src_frame->pts;
@@ -609,6 +793,13 @@ auto VideoDecoder::next_frame(Nv12Frame& out) -> rstd::Result<NextFrame, Error> 
 auto VideoDecoder::next_vk_frame(VkFrameView& out) -> rstd::Result<NextFrame, Error> {
     Error err;
     int   rc = next_vk_frame_(out, &err);
+    if (rc < 0) return rstd::Err(std::move(err));
+    return rstd::Ok(rc == 1 ? NextFrame::Eof : NextFrame::Ok);
+}
+
+auto VideoDecoder::next_drm_frame(DrmFrameView& out) -> rstd::Result<NextFrame, Error> {
+    Error err;
+    int   rc = next_drm_frame_(out, &err);
     if (rc < 0) return rstd::Err(std::move(err));
     return rstd::Ok(rc == 1 ? NextFrame::Eof : NextFrame::Ok);
 }

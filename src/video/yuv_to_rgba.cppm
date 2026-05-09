@@ -1,9 +1,20 @@
+module;
+
+/* GMF include: the YuvToRgba class declaration mentions PFNs (e.g.
+ * PFN_vkGetMemoryFdPropertiesKHR) that the wavsen::ffi::vulkan module
+ * does not currently `using`-export. Including <vulkan/vulkan.h> here
+ * makes them visible in this interface unit's purview without forcing
+ * a sibling-module change. import vulkan; below still re-exports the
+ * curated subset for downstream consumers. */
+#include <vulkan/vulkan.h>
+
 export module wavsen.video.yuv_to_rgba;
 
 import rstd.cppstd;
 import rstd;
 import vulkan;
 import wavsen.video.vk_device;        // Error
+import wavsen.video.video_decoder;    // DrmFrameView
 
 export namespace wavsen::video {
 
@@ -81,6 +92,18 @@ public:
                              const ColorMatrix&  cm)
         -> rstd::Result<int, Error>;
 
+    /* Zero-copy VAAPI path: imports the DrmFrameView's dma-buf fds as
+     * a disjoint multi-plane VkImage (NV12 → R8 + R8G8 plane views),
+     * runs the same nv12_to_rgba.comp into `dst`. The transient
+     * VkImage / VkDeviceMemory / fd dups live until the *next*
+     * convert_drm_prime call returns (cycled via last_drm_*). */
+    auto convert_drm_prime(const DrmFrameView& drm,
+                           VkImage             dst,
+                           std::uint32_t       dst_w,
+                           std::uint32_t       dst_h,
+                           const ColorMatrix&  cm)
+        -> rstd::Result<int, Error>;
+
 private:
     YuvToRgba() = default;
 
@@ -93,6 +116,9 @@ private:
     int  convert_av_vk_frame_(const VkFrameImports& imports, VkImage dst,
                               std::uint32_t dst_w, std::uint32_t dst_h,
                               const ColorMatrix& cm, Error* err);
+    int  convert_drm_prime_(const DrmFrameView& drm, VkImage dst,
+                            std::uint32_t dst_w, std::uint32_t dst_h,
+                            const ColorMatrix& cm, Error* err);
 
     VkInstance       instance_      { VK_NULL_HANDLE };
     VkPhysicalDevice phys_          { VK_NULL_HANDLE };
@@ -137,7 +163,15 @@ private:
     VkImageView      last_y_view_   { VK_NULL_HANDLE };
     VkImageView      last_uv_view_  { VK_NULL_HANDLE };
 
-    PFN_vkGetSemaphoreFdKHR vkGetSemaphoreFdKHR_ { nullptr };
+    /* Cycle of imported DRM-PRIME resources kept alive for one extra
+     * frame so the prior submit's GPU work can drain before destroy. */
+    VkImage          last_drm_image_       { VK_NULL_HANDLE };
+    VkDeviceMemory   last_drm_memories_[4] { VK_NULL_HANDLE, VK_NULL_HANDLE,
+                                             VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::uint32_t    last_drm_memory_count_ { 0 };
+
+    PFN_vkGetSemaphoreFdKHR        vkGetSemaphoreFdKHR_        { nullptr };
+    PFN_vkGetMemoryFdPropertiesKHR vkGetMemoryFdPropertiesKHR_ { nullptr };
 };
 
 } // namespace wavsen::video

@@ -40,5 +40,16 @@ if(WAVSEN_SWRESAMPLE_FOUND)
     target_link_libraries(wavsen_ffi_ffmpeg PUBLIC PkgConfig::WAVSEN_SWRESAMPLE)
 endif()
 
+# VAAPI: avutil.cppm conditionally exposes hwcontext_vaapi.h when both
+# libva is present (so <va/va.h> resolves) and the consumer compiles the
+# avutil partition with WAVSEN_HAS_VAAPI=1. The flag is set on the FFI
+# module itself (so module BMI matches) AND propagated to consumers via
+# INTERFACE_COMPILE_DEFINITIONS.
+if(WAVSEN_LIBVA_FOUND)
+    target_compile_definitions(wavsen_ffi_ffmpeg
+        PUBLIC WAVSEN_HAS_VAAPI=1)
+    target_link_libraries(wavsen_ffi_ffmpeg PUBLIC PkgConfig::WAVSEN_LIBVA)
+endif()
+
 set_property(TARGET wavsen_ffi_ffmpeg PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_target_properties(wavsen_ffi_ffmpeg PROPERTIES CXX_SCAN_FOR_MODULES ON)

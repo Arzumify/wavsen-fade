@@ -1,6 +1,14 @@
 module;
 
 #include <cstdint>             // uint32_t (used by nv12_to_rgba.spv.h) + UINT32_MAX
+#include <cstring>             // std::strerror (DRM_PRIME import error path)
+#include <cerrno>              // errno (dup of dma-buf fd)
+#include <unistd.h>            // ::dup, ::close (dma-buf ownership transfer to Vulkan)
+/* convert_drm_prime_ touches a wide slice of Vulkan: external memory FD
+ * import, image plane memory binding, DRM modifier image creation. The
+ * wavsen::ffi::vulkan module exports only a curated subset; pull the
+ * full header into the GMF for the implementation. */
+#include <vulkan/vulkan.h>
 #include "nv12_to_rgba.spv.h"  // generated at build time by glslangValidator
 
 module wavsen.video.yuv_to_rgba;
@@ -201,6 +209,11 @@ YuvToRgba::~YuvToRgba() {
         if (last_dst_view_)    vkDestroyImageView(device_, last_dst_view_, nullptr);
         if (last_y_view_)      vkDestroyImageView(device_, last_y_view_, nullptr);
         if (last_uv_view_)     vkDestroyImageView(device_, last_uv_view_, nullptr);
+        if (last_drm_image_)   vkDestroyImage(device_, last_drm_image_, nullptr);
+        for (uint32_t i = 0; i < last_drm_memory_count_; ++i) {
+            if (last_drm_memories_[i])
+                vkFreeMemory(device_, last_drm_memories_[i], nullptr);
+        }
         if (dpool_)            vkDestroyDescriptorPool(device_, dpool_, nullptr);
         if (signal_sem_)       vkDestroySemaphore(device_, signal_sem_, nullptr);
         if (done_fence_)       vkDestroyFence(device_, done_fence_, nullptr);
@@ -261,6 +274,11 @@ bool YuvToRgba::init(VkInstance instance, VkPhysicalDevice phys, VkDevice device
     if (!vkGetSemaphoreFdKHR_) {
         return fail(err, "vkGetSemaphoreFdKHR missing");
     }
+    /* Optional: only the convert_drm_prime path needs it; null-check at
+     * call site so devices without the extension still run sw / vulkan. */
+    vkGetMemoryFdPropertiesKHR_ =
+        reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
+            vkGetDeviceProcAddr(device_, "vkGetMemoryFdPropertiesKHR"));
 
     // ----- Sampler (linear, clamp-to-edge) -----
     {
@@ -939,6 +957,424 @@ int YuvToRgba::convert_av_vk_frame_(const VkFrameImports& im,
     return sync_fd;
 }
 
+/* DRM_PRIME zero-copy NV12. Imports the AVDRMFrameDescriptor's dma-buf
+ * fds as a disjoint multi-plane VkImage (G8_B8R8_2PLANE_420_UNORM with
+ * VK_EXT_image_drm_format_modifier), creates two single-plane R8/R8G8
+ * views, dispatches the existing nv12_to_rgba.comp into `dst`. The
+ * imported VkImage and its memory objects are deferred-destroyed at the
+ * *next* convert_drm_prime call (after the wait on done_fence_) so the
+ * GPU has fully consumed them. fds are dup'd for Vulkan to own. */
+int YuvToRgba::convert_drm_prime_(const DrmFrameView& drm,
+                                  VkImage             dst,
+                                  uint32_t            dst_w,
+                                  uint32_t            dst_h,
+                                  const ColorMatrix&  cm,
+                                  Error* err) {
+    if (dst == VK_NULL_HANDLE) { fail(err, "convert_drm_prime: dst null"); return -1; }
+    if (!vkGetMemoryFdPropertiesKHR_) {
+        fail(err, "convert_drm_prime: vkGetMemoryFdPropertiesKHR missing");
+        return -1;
+    }
+    if (drm.object_count == 0 || drm.layer_count == 0) {
+        fail(err, "convert_drm_prime: empty DRM_PRIME descriptor");
+        return -1;
+    }
+    if ((dst_w & 1u) || (dst_h & 1u)) {
+        fail(err, "convert_drm_prime: dst dims must be even");
+        return -1;
+    }
+    if (dst_w > max_w_ || dst_h > max_h_) {
+        fail(err, "convert_drm_prime: dst exceeds configured max extent");
+        return -1;
+    }
+
+    /* Wait for prior submit before we destroy last-cycle imports + reuse cmd_/dset_. */
+    if (fence_pending_) {
+        if (VkResult r = vkWaitForFences(device_, 1, &done_fence_, VK_TRUE,
+                                         1'000'000'000ull);
+            r != VK_SUCCESS) {
+            fail(err, std::string("vkWaitForFences: ") + vk_result_str(r));
+            return -1;
+        }
+        if (VkResult r = vkResetFences(device_, 1, &done_fence_); r != VK_SUCCESS) {
+            fail(err, std::string("vkResetFences: ") + vk_result_str(r));
+            return -1;
+        }
+        fence_pending_ = false;
+    }
+
+    /* Now safe to destroy last cycle's drm_image + memories. */
+    if (last_drm_image_) {
+        vkDestroyImage(device_, last_drm_image_, nullptr);
+        last_drm_image_ = VK_NULL_HANDLE;
+    }
+    for (uint32_t i = 0; i < last_drm_memory_count_; ++i) {
+        if (last_drm_memories_[i]) {
+            vkFreeMemory(device_, last_drm_memories_[i], nullptr);
+            last_drm_memories_[i] = VK_NULL_HANDLE;
+        }
+    }
+    last_drm_memory_count_ = 0;
+
+    /* Map (object_index, plane_index_in_layer) → flat plane index 0/1.
+     * Two valid descriptor layouts for NV12:
+     *   A) 1 layer, 2 planes  (Y=plane[0], UV=plane[1], potentially same fd)
+     *   B) 2 layers, 1 plane each (Y=layers[0].planes[0], UV=layers[1].planes[0])
+     * We collapse both to a flat planes[0]=Y, planes[1]=UV. */
+    struct FlatPlane {
+        uint32_t object_index;
+        uint64_t offset;
+        uint64_t pitch;
+    };
+    FlatPlane flat[2] {};
+    int flat_n = 0;
+    for (uint32_t li = 0; li < drm.layer_count && flat_n < 2; ++li) {
+        const auto& la = drm.layers[li];
+        for (uint32_t pi = 0; pi < la.plane_count && flat_n < 2; ++pi) {
+            flat[flat_n].object_index = la.planes[pi].object_index;
+            flat[flat_n].offset       = la.planes[pi].offset;
+            flat[flat_n].pitch        = la.planes[pi].pitch;
+            ++flat_n;
+        }
+    }
+    if (flat_n != 2) {
+        fail(err, "convert_drm_prime: expected 2 NV12 planes, got " +
+                  std::to_string(flat_n));
+        return -1;
+    }
+
+    const uint64_t modifier = drm.objects[0].format_modifier;
+
+    /* Build the multi-plane VkImage with explicit modifier + per-plane
+     * layout. DISJOINT lets us bind a separate VkDeviceMemory per plane
+     * — required when planes live in different fds. */
+    VkImage         drm_image      = VK_NULL_HANDLE;
+    VkDeviceMemory  plane_mem[2]   = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkImageView     y_view         = VK_NULL_HANDLE;
+    VkImageView     uv_view        = VK_NULL_HANDLE;
+    VkImageView     dst_view       = VK_NULL_HANDLE;
+    int             dup_fds[2]     = { -1, -1 };
+    bool            disjoint       = (flat[0].object_index != flat[1].object_index);
+
+    auto cleanup_on_fail = [&]() {
+        if (dst_view)   vkDestroyImageView(device_, dst_view, nullptr);
+        if (y_view)     vkDestroyImageView(device_, y_view, nullptr);
+        if (uv_view)    vkDestroyImageView(device_, uv_view, nullptr);
+        if (drm_image)  vkDestroyImage(device_, drm_image, nullptr);
+        for (int i = 0; i < 2; ++i) {
+            if (plane_mem[i]) vkFreeMemory(device_, plane_mem[i], nullptr);
+            if (dup_fds[i] >= 0) ::close(dup_fds[i]);
+        }
+    };
+
+    {
+        VkSubresourceLayout pl[2] {};
+        pl[0].offset   = flat[0].offset;
+        pl[0].rowPitch = flat[0].pitch;
+        pl[1].offset   = flat[1].offset;
+        pl[1].rowPitch = flat[1].pitch;
+        VkImageDrmFormatModifierExplicitCreateInfoEXT mci {};
+        mci.sType         = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
+        mci.drmFormatModifier   = modifier;
+        mci.drmFormatModifierPlaneCount = 2;
+        mci.pPlaneLayouts = pl;
+        VkExternalMemoryImageCreateInfo emi {};
+        emi.sType        = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+        emi.handleTypes  = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        emi.pNext        = &mci;
+        VkImageCreateInfo ici {};
+        ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.pNext         = &emi;
+        ici.imageType     = VK_IMAGE_TYPE_2D;
+        ici.format        = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+        ici.extent        = { drm.width, drm.height, 1 };
+        ici.mipLevels     = 1;
+        ici.arrayLayers   = 1;
+        ici.samples       = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling        = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+        ici.usage         = VK_IMAGE_USAGE_SAMPLED_BIT;
+        ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (disjoint) ici.flags |= VK_IMAGE_CREATE_DISJOINT_BIT;
+        if (VkResult r = vkCreateImage(device_, &ici, nullptr, &drm_image);
+            r != VK_SUCCESS) {
+            fail(err, std::string("vkCreateImage(DRM_PRIME, modifier=0x") +
+                      std::to_string(modifier) + "): " + vk_result_str(r));
+            cleanup_on_fail();
+            return -1;
+        }
+    }
+
+    /* Per-plane memory import. Vulkan takes ownership of imported fds —
+     * dup so the AVFrame can keep its own copy alive for the next pull. */
+    auto import_plane = [&](int plane_idx, uint32_t obj_idx,
+                            VkImageAspectFlagBits aspect) -> bool {
+        const int src_fd = drm.objects[obj_idx].fd;
+        const int dfd    = ::dup(src_fd);
+        if (dfd < 0) {
+            fail(err, std::string("dup(dma_buf): ") + std::strerror(errno));
+            return false;
+        }
+        dup_fds[plane_idx] = dfd;
+
+        VkMemoryFdPropertiesKHR fdp {};
+        fdp.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+        if (VkResult r = vkGetMemoryFdPropertiesKHR_(
+                device_, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dfd, &fdp);
+            r != VK_SUCCESS) {
+            fail(err, std::string("vkGetMemoryFdPropertiesKHR: ") + vk_result_str(r));
+            return false;
+        }
+
+        VkImagePlaneMemoryRequirementsInfo plane_req {};
+        plane_req.sType       = VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO;
+        plane_req.planeAspect = aspect;
+        VkImageMemoryRequirementsInfo2 req_info {};
+        req_info.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2;
+        req_info.image = drm_image;
+        if (disjoint) req_info.pNext = &plane_req;
+        VkMemoryRequirements2 req2 {};
+        req2.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+        vkGetImageMemoryRequirements2(device_, &req_info, &req2);
+
+        const uint32_t type_bits = req2.memoryRequirements.memoryTypeBits & fdp.memoryTypeBits;
+        const uint32_t mtype = pick_memory_type(phys_, type_bits, 0);
+        if (mtype == UINT32_MAX) {
+            fail(err, "convert_drm_prime: no compatible memory type for imported DMA-BUF");
+            return false;
+        }
+
+        VkImportMemoryFdInfoKHR ifi {};
+        ifi.sType      = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+        ifi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        ifi.fd         = dfd;
+        VkMemoryDedicatedAllocateInfo dai {};
+        dai.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+        dai.image = drm_image;
+        ifi.pNext = &dai;
+        VkMemoryAllocateInfo mai {};
+        mai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.pNext           = &ifi;
+        mai.allocationSize  = drm.objects[obj_idx].size;
+        mai.memoryTypeIndex = mtype;
+        if (VkResult r = vkAllocateMemory(device_, &mai, nullptr, &plane_mem[plane_idx]);
+            r != VK_SUCCESS) {
+            fail(err, std::string("vkAllocateMemory(import DMA-BUF): ") + vk_result_str(r));
+            return false;
+        }
+        /* fd is consumed by Vulkan on success — drop our tracked copy. */
+        dup_fds[plane_idx] = -1;
+        return true;
+    };
+
+    if (disjoint) {
+        if (!import_plane(0, flat[0].object_index, VK_IMAGE_ASPECT_PLANE_0_BIT) ||
+            !import_plane(1, flat[1].object_index, VK_IMAGE_ASPECT_PLANE_1_BIT)) {
+            cleanup_on_fail();
+            return -1;
+        }
+        VkBindImagePlaneMemoryInfo bp0 {};
+        bp0.sType       = VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO;
+        bp0.planeAspect = VK_IMAGE_ASPECT_PLANE_0_BIT;
+        VkBindImagePlaneMemoryInfo bp1 {};
+        bp1.sType       = VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO;
+        bp1.planeAspect = VK_IMAGE_ASPECT_PLANE_1_BIT;
+        VkBindImageMemoryInfo binds[2] {};
+        binds[0].sType        = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
+        binds[0].pNext        = &bp0;
+        binds[0].image        = drm_image;
+        binds[0].memory       = plane_mem[0];
+        binds[0].memoryOffset = 0;
+        binds[1].sType        = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
+        binds[1].pNext        = &bp1;
+        binds[1].image        = drm_image;
+        binds[1].memory       = plane_mem[1];
+        binds[1].memoryOffset = 0;
+        if (VkResult r = vkBindImageMemory2(device_, 2, binds); r != VK_SUCCESS) {
+            fail(err, std::string("vkBindImageMemory2(disjoint): ") + vk_result_str(r));
+            cleanup_on_fail();
+            return -1;
+        }
+    } else {
+        /* Both planes share one fd → one allocation, single bind. */
+        if (!import_plane(0, flat[0].object_index, VK_IMAGE_ASPECT_COLOR_BIT)) {
+            cleanup_on_fail();
+            return -1;
+        }
+        if (VkResult r = vkBindImageMemory(device_, drm_image, plane_mem[0], 0);
+            r != VK_SUCCESS) {
+            fail(err, std::string("vkBindImageMemory(joint): ") + vk_result_str(r));
+            cleanup_on_fail();
+            return -1;
+        }
+    }
+
+    /* Two single-aspect plane views: Y as R8, UV as R8G8. */
+    {
+        VkImageViewCreateInfo vci {};
+        vci.sType        = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vci.viewType     = VK_IMAGE_VIEW_TYPE_2D;
+        vci.image        = drm_image;
+        vci.components   = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                             VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
+        vci.subresourceRange = { VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 1, 0, 1 };
+        vci.format       = VK_FORMAT_R8_UNORM;
+        if (VkResult r = vkCreateImageView(device_, &vci, nullptr, &y_view);
+            r != VK_SUCCESS) {
+            fail(err, std::string("vkCreateImageView(DRM Y): ") + vk_result_str(r));
+            cleanup_on_fail();
+            return -1;
+        }
+        vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
+        vci.format       = VK_FORMAT_R8G8_UNORM;
+        if (VkResult r = vkCreateImageView(device_, &vci, nullptr, &uv_view);
+            r != VK_SUCCESS) {
+            fail(err, std::string("vkCreateImageView(DRM UV): ") + vk_result_str(r));
+            cleanup_on_fail();
+            return -1;
+        }
+        vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        vci.image  = dst;
+        vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+        if (VkResult r = vkCreateImageView(device_, &vci, nullptr, &dst_view);
+            r != VK_SUCCESS) {
+            fail(err, std::string("vkCreateImageView(DRM dst): ") + vk_result_str(r));
+            cleanup_on_fail();
+            return -1;
+        }
+    }
+
+    /* Descriptor write — same shape as the AVVkFrame path. */
+    {
+        VkDescriptorImageInfo dii_y  { sampler_, y_view,   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo dii_uv { sampler_, uv_view,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo dii_d  { VK_NULL_HANDLE, dst_view, VK_IMAGE_LAYOUT_GENERAL };
+        VkWriteDescriptorSet ws[3] {};
+        for (int i = 0; i < 3; ++i) {
+            ws[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            ws[i].dstSet          = dset_;
+            ws[i].dstBinding      = static_cast<uint32_t>(i);
+            ws[i].descriptorCount = 1;
+        }
+        ws[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        ws[0].pImageInfo     = &dii_y;
+        ws[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        ws[1].pImageInfo     = &dii_uv;
+        ws[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        ws[2].pImageInfo     = &dii_d;
+        vkUpdateDescriptorSets(device_, 3, ws, 0, nullptr);
+    }
+
+    if (VkResult r = vkResetCommandBuffer(cmd_, 0); r != VK_SUCCESS) {
+        fail(err, std::string("vkResetCommandBuffer: ") + vk_result_str(r));
+        cleanup_on_fail();
+        return -1;
+    }
+    VkCommandBufferBeginInfo bi {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (VkResult r = vkBeginCommandBuffer(cmd_, &bi); r != VK_SUCCESS) {
+        fail(err, std::string("vkBeginCommandBuffer: ") + vk_result_str(r));
+        cleanup_on_fail();
+        return -1;
+    }
+
+    /* Acquire imported image from FOREIGN queue family → ours, transition
+     * UNDEFINED → SHADER_READ_ONLY (we only read). UNDEFINED is correct
+     * because Vulkan must NOT preserve anything across the import — VAAPI
+     * already wrote NV12 contents into the dma-buf; the foreign-queue
+     * acquire grants us read access. */
+    barrier_image(cmd_, drm_image, 0, VK_ACCESS_SHADER_READ_BIT,
+                  VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VK_QUEUE_FAMILY_FOREIGN_EXT, queue_family_);
+    barrier_image(cmd_, dst, 0, VK_ACCESS_SHADER_WRITE_BIT,
+                  VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipeline_layout_, 0, 1, &dset_, 0, nullptr);
+    ShaderPushConstants pc {};
+    pc.dst_w = dst_w; pc.dst_h = dst_h;
+    for (int i = 0; i < 3; ++i) {
+        pc.m_r[i]    = cm.m_r[i];
+        pc.m_g[i]    = cm.m_g[i];
+        pc.m_b[i]    = cm.m_b[i];
+        pc.offset[i] = cm.offset[i];
+    }
+    vkCmdPushConstants(cmd_, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(pc), &pc);
+    const uint32_t gx = (dst_w + 7) / 8;
+    const uint32_t gy = (dst_h + 7) / 8;
+    vkCmdDispatch(cmd_, gx, gy, 1);
+
+    /* Release dst to FOREIGN queue family for the bridge consumer. The
+     * imported drm_image goes back to FOREIGN too — VAAPI doesn't track
+     * Vulkan layouts, but the foreign-queue release is the spec-required
+     * way to relinquish ownership of an external resource. */
+    barrier_image(cmd_, drm_image,
+                  VK_ACCESS_SHADER_READ_BIT, 0,
+                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                  queue_family_, VK_QUEUE_FAMILY_FOREIGN_EXT);
+    barrier_image(cmd_, dst,
+                  VK_ACCESS_SHADER_WRITE_BIT, 0,
+                  VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                  queue_family_, VK_QUEUE_FAMILY_FOREIGN_EXT);
+
+    if (VkResult r = vkEndCommandBuffer(cmd_); r != VK_SUCCESS) {
+        fail(err, std::string("vkEndCommandBuffer: ") + vk_result_str(r));
+        cleanup_on_fail();
+        return -1;
+    }
+
+    /* Single binary signal_sem_ for the bridge SYNC_FD export — no
+     * wait semaphore: VAAPI submits its own decode work synchronously
+     * to the dma-buf via implicit sync; the foreign-queue acquire
+     * barrier above is the cross-API sync point. */
+    VkSubmitInfo si {};
+    si.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount   = 1;
+    si.pCommandBuffers      = &cmd_;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores    = &signal_sem_;
+    if (VkResult r = vkQueueSubmit(queue_, 1, &si, done_fence_); r != VK_SUCCESS) {
+        fail(err, std::string("vkQueueSubmit: ") + vk_result_str(r));
+        cleanup_on_fail();
+        return -1;
+    }
+    fence_pending_ = true;
+
+    VkSemaphoreGetFdInfoKHR sgfi {};
+    sgfi.sType      = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+    sgfi.semaphore  = signal_sem_;
+    sgfi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+    int sync_fd = -1;
+    if (VkResult r = vkGetSemaphoreFdKHR_(device_, &sgfi, &sync_fd); r != VK_SUCCESS) {
+        fail(err, std::string("vkGetSemaphoreFdKHR: ") + vk_result_str(r));
+        cleanup_on_fail();
+        return -1;
+    }
+
+    /* Cycle this submit's resources into the deferred-destroy slots,
+     * destroyed at next call (or in the destructor). Views go to the
+     * standard last_*_view_ slots (sized for one cycle). The drm image
+     * + memory get a private slot pair for the same one-cycle deferral. */
+    if (last_dst_view_) vkDestroyImageView(device_, last_dst_view_, nullptr);
+    if (last_y_view_)   vkDestroyImageView(device_, last_y_view_,   nullptr);
+    if (last_uv_view_)  vkDestroyImageView(device_, last_uv_view_,  nullptr);
+    last_dst_view_ = dst_view;
+    last_y_view_   = y_view;
+    last_uv_view_  = uv_view;
+    last_drm_image_ = drm_image;
+    last_drm_memory_count_ = disjoint ? 2u : 1u;
+    last_drm_memories_[0]  = plane_mem[0];
+    last_drm_memories_[1]  = plane_mem[1];
+    return sync_fd;
+}
+
 // ---------------------------------------------------------------------------
 // Public Result wrappers around the legacy out-param helpers above.
 // ---------------------------------------------------------------------------
@@ -958,6 +1394,16 @@ auto YuvToRgba::convert_av_vk_frame(const VkFrameImports& imports, VkImage dst,
     -> rstd::Result<int, Error> {
     Error err;
     int   fd = convert_av_vk_frame_(imports, dst, dst_w, dst_h, cm, &err);
+    if (fd < 0) return rstd::Err(std::move(err));
+    return rstd::Ok(fd);
+}
+
+auto YuvToRgba::convert_drm_prime(const DrmFrameView& drm, VkImage dst,
+                                  uint32_t dst_w, uint32_t dst_h,
+                                  const ColorMatrix& cm)
+    -> rstd::Result<int, Error> {
+    Error err;
+    int   fd = convert_drm_prime_(drm, dst, dst_w, dst_h, cm, &err);
     if (fd < 0) return rstd::Err(std::move(err));
     return rstd::Ok(fd);
 }

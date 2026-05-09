@@ -54,6 +54,72 @@ struct VkFrameView {
     std::uint32_t  bit_depth   { 8 };
 };
 
+// User selection for the hwaccel chain. Auto resolves to [Vulkan, Vaapi]
+// (then sw decode if both fail).
+enum class HwAccel {
+    Auto    = 0,
+    Vulkan  = 1,
+    Vaapi   = 2,
+    None    = 3,
+};
+
+struct OpenOpts {
+    HwAccel     hwaccel { HwAccel::Auto };
+    // DRM render node (e.g. "/dev/dri/renderD128") for AV_HWDEVICE_TYPE_VAAPI.
+    // Empty → FFmpeg picks the default.
+    std::string render_node;
+};
+
+// Which pump method the caller should drive for the next frame. Each
+// frame is decoded into exactly one of the three concrete views.
+enum class FrameKind {
+    Sw          = 0,  // call next_frame(Nv12Frame&)
+    VulkanShared = 1, // call next_vk_frame(VkFrameView&)
+    VaapiDrm    = 2,  // call next_drm_frame(DrmFrameView&)
+};
+
+// Mirror of one AVDRMPlaneDescriptor entry — which `object_index` of
+// the parent DrmFrameView's `objects[]` it lives in, plus byte offset
+// and row pitch into that fd's buffer.
+struct DrmPlane {
+    std::uint32_t object_index;
+    std::uint64_t offset;
+    std::uint64_t pitch;
+};
+
+// Mirror of one AVDRMLayerDescriptor — describes a logical image
+// (drm_fourcc + N planes). NV12 always lands as either:
+//   1 layer / 2 planes (Y + UV interleaved into the same DRM_FORMAT_NV12)
+//   or 2 layers / 1 plane each (Y as DRM_FORMAT_R8, UV as DRM_FORMAT_GR88).
+struct DrmLayer {
+    std::uint32_t fourcc;
+    std::uint32_t plane_count;
+    DrmPlane      planes[4];
+};
+
+struct DrmObject {
+    int            fd;          // dup'd; owned by VideoDecoder until next pull
+    std::uint64_t  size;
+    std::uint64_t  format_modifier;
+};
+
+// VAAPI surface mapped to DRM_PRIME via av_hwframe_map. Snapshot copy:
+// safe to read after the next next_drm_frame() call (but the fds it
+// references are unref'd then, so consumers must dup or finish using
+// them within the cycle).
+struct DrmFrameView {
+    std::uint32_t object_count { 0 };
+    DrmObject     objects[4]   {};
+    std::uint32_t layer_count  { 0 };
+    DrmLayer      layers[4]    {};
+    std::uint32_t width        { 0 };
+    std::uint32_t height       { 0 };
+    double        pts_seconds  { -1.0 };
+    std::uint32_t colorspace   { 0 };
+    std::uint32_t color_range  { 0 };
+    std::uint32_t bit_depth    { 8 };
+};
+
 class VideoDecoder {
 public:
     // Read the native video resolution from the file's first video
@@ -67,14 +133,17 @@ public:
                      std::uint32_t target_w, std::uint32_t target_h, bool loop)
         -> rstd::Result<std::unique_ptr<VideoDecoder>, Error>;
 
-    // Shared-device variant: bring up AV_HWDEVICE_TYPE_VULKAN on top of
-    // the Producer's VkInstance/VkDevice. On success, decoded frames stay
-    // GPU-resident; the caller uses `next_vk_frame()`. On any setup
-    // failure the decoder falls back transparently to sw decode and
-    // `using_vk_frames()` returns false.
+    // Shared-device variant: bring up an FFmpeg hwdevice (Vulkan and/or
+    // VAAPI per `opts.hwaccel`) on top of the Producer's VkInstance.
+    //   Auto    → try Vulkan first, then VAAPI, then fall back to sw.
+    //   Vulkan  → only Vulkan (then sw).
+    //   Vaapi   → only VAAPI (then sw).
+    //   None    → sw decode unconditionally.
+    // The caller uses `kind()` to discover which pump to drive.
     static auto open_with_vk(const std::string& path,
                              std::uint32_t target_w, std::uint32_t target_h, bool loop,
-                             const Producer& vk)
+                             const Producer& vk,
+                             const OpenOpts& opts = {})
         -> rstd::Result<std::unique_ptr<VideoDecoder>, Error>;
 
     ~VideoDecoder();
@@ -83,9 +152,13 @@ public:
 
     auto next_frame(Nv12Frame& out) -> rstd::Result<NextFrame, Error>;
 
-    bool using_vk_frames() const { return using_vk_frames_; }
+    // Which pump matches the active backend. `using_vk_frames()` is the
+    // legacy boolean accessor — true iff kind() == VulkanShared.
+    FrameKind kind() const           { return kind_; }
+    bool      using_vk_frames() const { return kind_ == FrameKind::VulkanShared; }
 
     auto next_vk_frame(VkFrameView& out) -> rstd::Result<NextFrame, Error>;
+    auto next_drm_frame(DrmFrameView& out) -> rstd::Result<NextFrame, Error>;
 
     std::uint32_t width() const  { return target_w_; }
     std::uint32_t height() const { return target_h_; }
@@ -96,24 +169,27 @@ public:
 private:
     VideoDecoder() = default;
 
-    // Internal builder kept in the legacy out-param style to minimize
-    // code churn — `pre_built_hwdev` is AVBufferRef* type-erased to void*.
+    // Internal builder. `pre_built_hwdev` is AVBufferRef* type-erased to
+    // void*; `requested_kind` records the hw mode the trial loop picked
+    // so the per-frame pump knows which side-data to extract.
     static std::unique_ptr<VideoDecoder>
     build_internal(const std::string& path,
                    std::uint32_t target_w, std::uint32_t target_h,
                    bool loop, void* pre_built_hwdev,
+                   FrameKind requested_kind,
                    Error* err);
 
     // Internal frame-pull helpers using the legacy in/out style. The
     // returned int encodes: 0 = ok, 1 = eof, -1 = error.
     int next_frame_(Nv12Frame& out, Error* err);
     int next_vk_frame_(VkFrameView& out, Error* err);
+    int next_drm_frame_(DrmFrameView& out, Error* err);
 
     std::unique_ptr<State> st_;
     std::uint32_t target_w_ { 0 };
     std::uint32_t target_h_ { 0 };
     bool          loop_     { false };
-    bool          using_vk_frames_ { false };
+    FrameKind     kind_     { FrameKind::Sw };
 };
 
 } // namespace wavsen::video
