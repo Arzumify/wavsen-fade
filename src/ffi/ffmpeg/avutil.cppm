@@ -75,7 +75,11 @@ using ::AVHWDeviceContext;
 using ::AVHWFramesContext;
 using ::AVVulkanDeviceContext;
 using ::AVVulkanDeviceQueueFamily;
+using ::AVVulkanFramesContext;
 using ::AVVkFrame;
+using ::AVVkFrameFlags;
+using ::AV_VK_FRAME_FLAG_NONE;
+using ::AV_VK_FRAME_FLAG_DISABLE_MULTIPLANE;
 #if defined(WAVSEN_HAS_VAAPI)
 using ::AVVAAPIDeviceContext;
 using ::AVVAAPIFramesContext;
@@ -144,6 +148,7 @@ using ::av_channel_layout_uninit;
 using ::av_hwdevice_ctx_alloc;
 using ::av_hwdevice_ctx_create;
 using ::av_hwdevice_ctx_init;
+using ::av_hwframe_ctx_init;
 using ::av_hwframe_transfer_data;
 using ::av_hwframe_map;
 

@@ -715,11 +715,22 @@ int YuvToRgba::convert_av_vk_frame_(const VkFrameImports& im,
                                    const ColorMatrix&  cm,
                                    Error* err) {
     if (dst == VK_NULL_HANDLE) { fail(err, "convert_av_vk_frame: dst null"); return -1; }
-    if (im.y_image == VK_NULL_HANDLE || im.uv_image == VK_NULL_HANDLE) {
-        fail(err, "convert_av_vk_frame: AVVkFrame missing Y or UV plane "
-                  "(DISABLE_MULTIPLANE not honoured?)");
+    if (im.y_image == VK_NULL_HANDLE) {
+        fail(err, "convert_av_vk_frame: AVVkFrame y_image NULL");
         return -1;
     }
+    /* Two layouts the producer can hand us:
+     *   - disjoint:           y_image != uv_image, two separate VkImages
+     *                         in R8 / R8G8 (or R16 / R16G16 for 10-bit);
+     *   - single multi-plane: uv_image == NULL (or == y_image), one
+     *                         VkImage with VK_FORMAT_G8_B8R8_2PLANE_420_UNORM
+     *                         backing both planes — what FFmpeg's vulkan
+     *                         video decode produces (AV_VK_FRAME_FLAG_
+     *                         DISABLE_MULTIPLANE is silently ignored for
+     *                         the DPB by the spec).
+     * In single-image mode we sample plane 0 / plane 1 via aspect masks. */
+    const bool single_image = (im.uv_image == VK_NULL_HANDLE)
+                           || (im.uv_image == im.y_image);
     if ((dst_w & 1u) || (dst_h & 1u)) {
         fail(err, "convert_av_vk_frame: dst dims must be even");
         return -1;
@@ -761,23 +772,45 @@ int YuvToRgba::convert_av_vk_frame_(const VkFrameImports& im,
         VkImageViewCreateInfo vci {};
         vci.sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         vci.viewType         = VK_IMAGE_VIEW_TYPE_2D;
-        vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         vci.components       = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
                                  VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
 
-        const VkFormat y_fmt  = (im.bit_depth >= 16)
-            ? VK_FORMAT_R16_UNORM   : VK_FORMAT_R8_UNORM;
-        const VkFormat uv_fmt = (im.bit_depth >= 16)
-            ? VK_FORMAT_R16G16_UNORM : VK_FORMAT_R8G8_UNORM;
+        /* Per-plane formats:
+         *   - disjoint 8-bit:  R8_UNORM    / R8G8_UNORM
+         *   - disjoint 10-bit: R16_UNORM   / R16G16_UNORM
+         *   - single multi-plane (always 8-bit here; 10-bit via plane
+         *     view requires R10X6_UNORM_PACK16 / R10X6G10X6_UNORM_2PACK16
+         *     and the shader expects 8-bit for now): R8_UNORM / R8G8_UNORM
+         *     + VK_IMAGE_ASPECT_PLANE_{0,1}_BIT. */
+        VkFormat y_fmt, uv_fmt;
+        if (single_image) {
+            y_fmt  = VK_FORMAT_R8_UNORM;
+            uv_fmt = VK_FORMAT_R8G8_UNORM;
+        } else {
+            y_fmt  = (im.bit_depth >= 16)
+                ? VK_FORMAT_R16_UNORM   : VK_FORMAT_R8_UNORM;
+            uv_fmt = (im.bit_depth >= 16)
+                ? VK_FORMAT_R16G16_UNORM : VK_FORMAT_R8G8_UNORM;
+        }
+
+        const VkImageAspectFlags y_aspect  = single_image
+            ? VkImageAspectFlags(VK_IMAGE_ASPECT_PLANE_0_BIT)
+            : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
+        const VkImageAspectFlags uv_aspect = single_image
+            ? VkImageAspectFlags(VK_IMAGE_ASPECT_PLANE_1_BIT)
+            : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
+
         vci.image  = im.y_image;
         vci.format = y_fmt;
+        vci.subresourceRange = { y_aspect, 0, 1, 0, 1 };
         if (VkResult r = vkCreateImageView(device_, &vci, nullptr, &y_view);
             r != VK_SUCCESS) {
             fail(err, std::string("vkCreateImageView(Y, AVVkFrame): ") + vk_result_str(r));
             cleanup_views(); return -1;
         }
-        vci.image  = im.uv_image;
+        vci.image  = single_image ? im.y_image : im.uv_image;
         vci.format = uv_fmt;
+        vci.subresourceRange = { uv_aspect, 0, 1, 0, 1 };
         if (VkResult r = vkCreateImageView(device_, &vci, nullptr, &uv_view);
             r != VK_SUCCESS) {
             fail(err, std::string("vkCreateImageView(UV, AVVkFrame): ") + vk_result_str(r));
@@ -785,6 +818,7 @@ int YuvToRgba::convert_av_vk_frame_(const VkFrameImports& im,
         }
         vci.image  = dst;
         vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         if (VkResult r = vkCreateImageView(device_, &vci, nullptr, &dst_view);
             r != VK_SUCCESS) {
             fail(err, std::string("vkCreateImageView(dst, AVVkFrame): ") + vk_result_str(r));
@@ -827,7 +861,8 @@ int YuvToRgba::convert_av_vk_frame_(const VkFrameImports& im,
     }
 
     /* Acquire Y/UV from FFmpeg's queue family → ours, transition to
-     * SHADER_READ_ONLY. */
+     * SHADER_READ_ONLY. Single-image path emits ONE barrier on the
+     * shared VkImage (covers all planes). */
     const uint32_t y_src_qf  = *im.y_qf_in_out;
     const uint32_t uv_src_qf = *im.uv_qf_in_out;
     barrier_image(cmd_, im.y_image,
@@ -835,11 +870,13 @@ int YuvToRgba::convert_av_vk_frame_(const VkFrameImports& im,
                   *im.y_layout_in_out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                   y_src_qf, queue_family_);
-    barrier_image(cmd_, im.uv_image,
-                  0, VK_ACCESS_SHADER_READ_BIT,
-                  *im.uv_layout_in_out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                  uv_src_qf, queue_family_);
+    if (!single_image) {
+        barrier_image(cmd_, im.uv_image,
+                      0, VK_ACCESS_SHADER_READ_BIT,
+                      *im.uv_layout_in_out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      uv_src_qf, queue_family_);
+    }
 
     /* dst: UNDEFINED → GENERAL. */
     barrier_image(cmd_, dst, 0, VK_ACCESS_SHADER_WRITE_BIT,
@@ -871,11 +908,13 @@ int YuvToRgba::convert_av_vk_frame_(const VkFrameImports& im,
                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                   queue_family_, y_src_qf);
-    barrier_image(cmd_, im.uv_image,
-                  VK_ACCESS_SHADER_READ_BIT, 0,
-                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                  queue_family_, uv_src_qf);
+    if (!single_image) {
+        barrier_image(cmd_, im.uv_image,
+                      VK_ACCESS_SHADER_READ_BIT, 0,
+                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                      queue_family_, uv_src_qf);
+    }
     barrier_image(cmd_, dst,
                   VK_ACCESS_SHADER_WRITE_BIT, 0,
                   VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
@@ -889,7 +928,11 @@ int YuvToRgba::convert_av_vk_frame_(const VkFrameImports& im,
 
     /* Wait on AVVkFrame's timeline semaphores at their current values,
      * signal incremented values back. Plus our binary signal_sem_ for
-     * the bridge SYNC_FD export. */
+     * the bridge SYNC_FD export. Single-image path uses one shared
+     * timeline; main.cpp aliases y/uv to the same sem/value pointer
+     * so we deduplicate here to avoid waiting on the same semaphore
+     * twice (Vulkan UB). */
+    const bool sem_shared       = (im.y_sem == im.uv_sem);
     const uint64_t y_wait_val   = *im.y_sem_val_in_out;
     const uint64_t uv_wait_val  = *im.uv_sem_val_in_out;
     const uint64_t y_signal_val  = y_wait_val  + 1;
@@ -901,26 +944,33 @@ int YuvToRgba::convert_av_vk_frame_(const VkFrameImports& im,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
     };
-    /* Signal: timelines + binary (binary value is ignored; we set 0). */
+    const uint32_t wait_count = sem_shared ? 1u : 2u;
+
+    /* Signal: timeline(s) + binary (binary value is ignored; we set 0). */
     VkSemaphore signal_sems[3] = { im.y_sem, im.uv_sem, signal_sem_ };
     uint64_t    signal_vals[3] = { y_signal_val, uv_signal_val, 0 };
+    if (sem_shared) {
+        signal_sems[1] = signal_sem_;
+        signal_vals[1] = 0;
+    }
+    const uint32_t signal_count = sem_shared ? 2u : 3u;
 
     VkTimelineSemaphoreSubmitInfo tsi {};
     tsi.sType                     = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-    tsi.waitSemaphoreValueCount   = 2;
+    tsi.waitSemaphoreValueCount   = wait_count;
     tsi.pWaitSemaphoreValues      = wait_vals;
-    tsi.signalSemaphoreValueCount = 3;
+    tsi.signalSemaphoreValueCount = signal_count;
     tsi.pSignalSemaphoreValues    = signal_vals;
 
     VkSubmitInfo si {};
     si.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.pNext                = &tsi;
-    si.waitSemaphoreCount   = 2;
+    si.waitSemaphoreCount   = wait_count;
     si.pWaitSemaphores      = wait_sems;
     si.pWaitDstStageMask    = wait_stages;
     si.commandBufferCount   = 1;
     si.pCommandBuffers      = &cmd_;
-    si.signalSemaphoreCount = 3;
+    si.signalSemaphoreCount = signal_count;
     si.pSignalSemaphores    = signal_sems;
     if (VkResult r = vkQueueSubmit(queue_, 1, &si, done_fence_); r != VK_SUCCESS) {
         fail(err, std::string("vkQueueSubmit: ") + vk_result_str(r));

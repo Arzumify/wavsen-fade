@@ -77,19 +77,62 @@ uint32_t map_range(int r) {
 /* `get_format` callback: prefer AV_PIX_FMT_VULKAN whenever the codec
  * offers it; fall back to whatever FFmpeg picks by default otherwise.
  *
- * Do NOT pre-allocate cctx->hw_frames_ctx here. FFmpeg's
- * ff_decode_get_hw_frames_ctx short-circuits when hw_frames_ctx is
- * already set, which skips the vulkan hwaccel's frame_params callback
- * — and that callback is what bootstraps FFVulkanDecodeContext::
- * shared_ctx. Skipping it makes ff_vk_decode_init dereference a NULL
- * shared_ctx (crash in ff_vk_init via &NULL->s == 0x0). Letting
- * FFmpeg own the hw_frames_ctx means we accept whatever VkFormat it
- * picks (typically the multi-plane VK_FORMAT_G8_B8R8_2PLANE_420_UNORM
- * on AMD/RADV); the sw download path in next_frame doesn't care. */
+ * This is the moment to bootstrap hw_frames_ctx — get_format fires
+ * during avcodec_open2 with avctx->internal already allocated, so
+ * avcodec_get_hw_frames_parameters (which derefs internal in
+ * ff_decode_get_hw_frames_ctx) is safe to call. Calling it earlier
+ * (between avcodec_alloc_context3 and avcodec_open2) segfaults.
+ *
+ * We set AV_VK_FRAME_FLAG_DISABLE_MULTIPLANE on AVVulkanFramesContext
+ * — but FFmpeg's vulkan video-decode hwaccel silently ignores it
+ * because Vulkan VK_KHR_video_decode_h264 et al. require the DPB to
+ * be a single multi-plane VkImage (G8_B8R8_2PLANE_420_UNORM). The
+ * resulting AVVkFrame has img[0] = single VkImage, img[1] = NULL.
+ * `convert_av_vk_frame_` handles that layout via plane-aspect views
+ * (VK_IMAGE_ASPECT_PLANE_{0,1}_BIT). The flag remains set for
+ * forward compatibility / non-decode use cases.
+ *
+ * On any failure inside this callback we fall through to default
+ * get_format → sw pix_fmt. build_internal probes after open by
+ * sending one packet so cctx->pix_fmt is populated, then resets
+ * kind_ to Sw if hwaccel was rejected. */
 AVPixelFormat get_format_prefer_vulkan(AVCodecContext* cctx,
                                        const AVPixelFormat* fmts) {
     for (const AVPixelFormat* p = fmts; *p != AV_PIX_FMT_NONE; ++p) {
-        if (*p == AV_PIX_FMT_VULKAN) return AV_PIX_FMT_VULKAN;
+        if (*p != AV_PIX_FMT_VULKAN) continue;
+
+        AVBufferRef* hw_frames = nullptr;
+        int rc = avcodec_get_hw_frames_parameters(
+            cctx, cctx->hw_device_ctx, AV_PIX_FMT_VULKAN, &hw_frames);
+        if (rc < 0 || !hw_frames) {
+            rstd::log::warn(
+                "get_format_prefer_vulkan: avcodec_get_hw_frames_parameters "
+                "failed ({}); falling back to default get_format.",
+                av_err_str(rc));
+            if (hw_frames) av_buffer_unref(&hw_frames);
+            break;
+        }
+        auto* fc  = reinterpret_cast<AVHWFramesContext*>(hw_frames->data);
+        auto* vfc = reinterpret_cast<AVVulkanFramesContext*>(fc->hwctx);
+        vfc->flags = static_cast<AVVkFrameFlags>(
+            static_cast<unsigned>(vfc->flags)
+            | static_cast<unsigned>(AV_VK_FRAME_FLAG_NONE)
+            | static_cast<unsigned>(AV_VK_FRAME_FLAG_DISABLE_MULTIPLANE));
+        if (int irc = av_hwframe_ctx_init(hw_frames); irc < 0) {
+            rstd::log::warn(
+                "get_format_prefer_vulkan: av_hwframe_ctx_init "
+                "(DISABLE_MULTIPLANE) failed ({}); falling back to default "
+                "get_format.", av_err_str(irc));
+            av_buffer_unref(&hw_frames);
+            break;
+        }
+        if (cctx->hw_frames_ctx) av_buffer_unref(&cctx->hw_frames_ctx);
+        cctx->hw_frames_ctx = hw_frames;
+        rstd::log::info(
+            "get_format_prefer_vulkan: AV_PIX_FMT_VULKAN selected "
+            "(DISABLE_MULTIPLANE, sw_format={}).",
+            av_get_pix_fmt_name(fc->sw_format));
+        return AV_PIX_FMT_VULKAN;
     }
     return avcodec_default_get_format(cctx, fmts);
 }
@@ -414,6 +457,11 @@ VideoDecoder::build_internal(const std::string& path,
     if (self->st_->hwd) {
         self->st_->cctx->hw_device_ctx = av_buffer_ref(self->st_->hwd.get());
         if (requested_kind == FrameKind::VulkanShared) {
+            /* get_format_prefer_vulkan runs during avcodec_open2 below
+             * and bootstraps a DISABLE_MULTIPLANE hw_frames_ctx if it
+             * picks AV_PIX_FMT_VULKAN. On any failure inside that
+             * callback the codec falls through to a sw pix_fmt; we
+             * detect that after open and reset kind_ to Sw. */
             self->st_->cctx->get_format = get_format_prefer_vulkan;
             rstd::log::info(
                 "VideoDecoder: AV_HWDEVICE_TYPE_VULKAN attached for codec {}.",
@@ -438,23 +486,53 @@ VideoDecoder::build_internal(const std::string& path,
         return nullptr;
     }
 
-    /* The zero-copy next_vk_frame path requires DISABLE_MULTIPLANE
-     * AVVkFrames (img[0]=Y, img[1]=UV) to match the GPU YUV→RGB
-     * shader's R8 + R8G8 sampler bindings. We can't set that flag
-     * without bypassing FFmpeg's frame_params bootstrap (see comment
-     * on get_format_prefer_vulkan), so the Vulkan-shared path always
-     * downgrades to Sw at frame-pump time. The VAAPI path stays as
-     * VaapiDrm — av_hwframe_map handles modifier negotiation. */
-    if (requested_kind == FrameKind::VulkanShared) {
-        self->kind_ = FrameKind::Sw;
-    }
-
     self->st_->pkt.reset(av_packet_alloc());
     self->st_->src_frame.reset(av_frame_alloc());
     if (!self->st_->pkt || !self->st_->src_frame) {
         fail(err, "av_packet_alloc / av_frame_alloc failed");
         return nullptr;
     }
+
+    /* Force get_format to run by feeding one probe packet — h264
+     * (and most modern codecs) only invoke get_format on first frame
+     * decode, not at avcodec_open2 time. We need to know whether the
+     * vulkan hwaccel actually accepted the codec NOW, before
+     * returning, so the caller drives the right pump method.
+     *
+     * Read frames until we hit a video packet, send it, then seek
+     * back and flush so the user's first next_*_frame call starts
+     * from the beginning as if nothing happened. */
+    if (requested_kind == FrameKind::VulkanShared) {
+        AVPacket* probe = av_packet_alloc();
+        if (probe) {
+            bool got_video = false;
+            while (av_read_frame(self->st_->fmt.get(), probe) >= 0) {
+                if (probe->stream_index == self->st_->video_idx) {
+                    got_video = true;
+                    break;
+                }
+                av_packet_unref(probe);
+            }
+            if (got_video) {
+                avcodec_send_packet(self->st_->cctx.get(), probe);
+                av_packet_unref(probe);
+            }
+            av_packet_free(&probe);
+
+            if (av_seek_frame(self->st_->fmt.get(), -1, 0, AVSEEK_FLAG_BACKWARD) >= 0) {
+                avcodec_flush_buffers(self->st_->cctx.get());
+            }
+        }
+
+        if (self->st_->cctx->pix_fmt != AV_PIX_FMT_VULKAN) {
+            rstd::log::warn(
+                "VideoDecoder: vulkan hwaccel rejected the stream "
+                "(pix_fmt={} after probe); decoder downgraded to sw.",
+                av_get_pix_fmt_name(self->st_->cctx->pix_fmt));
+            self->kind_ = FrameKind::Sw;
+        }
+    }
+
     return self;
 }
 

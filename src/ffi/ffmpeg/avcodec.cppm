@@ -20,6 +20,7 @@ using ::avcodec_default_get_format;
 using ::avcodec_find_decoder;
 using ::avcodec_flush_buffers;
 using ::avcodec_free_context;
+using ::avcodec_get_hw_frames_parameters;
 using ::avcodec_get_name;
 using ::avcodec_open2;
 using ::avcodec_parameters_to_context;
