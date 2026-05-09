@@ -39,7 +39,7 @@ public:
 
     // Force the next call to re-prime the baseline. Useful when the
     // caller knows the stream just looped or the decoder was reset.
-    void reset() { primed_ = false; t0_pts_ = -1.0; }
+    void reset() { primed_ = false; t0_pts_ = -1.0; external_drop_streak_ = 0; }
 
     // Install an external (audio) master clock. Pass nullptr to revert to
     // wall-clock pacing.
@@ -60,7 +60,19 @@ public:
                 const double skew = pts_seconds - now_pts;
                 const double max_lag_s   = std::chrono::duration<double>(max_lag_).count();
                 const double max_sleep_s = std::chrono::duration<double>(max_sleep_).count();
-                if (skew < -max_lag_s)   return false;
+                if (skew < -max_lag_s) {
+                    // Video far behind the audio clock. Normally drop,
+                    // but if we've been dropping for a long stretch the
+                    // decoder can't catch up to where audio is — let one
+                    // frame through to break the infinite-drop loop and
+                    // re-converge on a closer PTS over the next frames.
+                    if (++external_drop_streak_ >= kExternalDropStreakReset) {
+                        external_drop_streak_ = 0;
+                        return true;
+                    }
+                    return false;
+                }
+                external_drop_streak_ = 0;
                 if (skew >  max_sleep_s) return true;
                 if (skew > 0.0) {
                     std::this_thread::sleep_for(
@@ -105,11 +117,17 @@ public:
     }
 
 private:
-    Duration  max_lag_;
-    Duration  max_sleep_;
-    TimePoint t0_wall_ {};
-    double    t0_pts_  { -1.0 };
-    bool      primed_  { false };
+    // External-clock drop streak before forcing one present-through.
+    // 30 ≈ 1 s @ 30 fps — long enough to ride out a real backpressure
+    // burst, short enough that A/V doesn't drift past noticeable.
+    static constexpr std::uint32_t kExternalDropStreakReset = 30;
+
+    Duration      max_lag_;
+    Duration      max_sleep_;
+    TimePoint     t0_wall_ {};
+    double        t0_pts_  { -1.0 };
+    bool          primed_  { false };
+    std::uint32_t external_drop_streak_ { 0 };
     std::function<double()> clock_fn_;
 };
 
