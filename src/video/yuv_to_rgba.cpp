@@ -200,6 +200,33 @@ void barrier_image(VkCommandBuffer cmd, VkImage img,
     vkCmdPipelineBarrier(cmd, src_s, dst_s, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
+// sync2 variant: only this can name VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR
+// for the cross-queue hazard tracker after vkCmdDecodeVideoKHR.
+void barrier_image2(VkCommandBuffer cmd, VkImage img,
+                    VkPipelineStageFlags2 src_s, VkAccessFlags2 src_a,
+                    VkPipelineStageFlags2 dst_s, VkAccessFlags2 dst_a,
+                    VkImageLayout old_l, VkImageLayout new_l,
+                    uint32_t src_qf = VK_QUEUE_FAMILY_IGNORED,
+                    uint32_t dst_qf = VK_QUEUE_FAMILY_IGNORED) {
+    VkImageMemoryBarrier2 b {};
+    b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    b.srcStageMask        = src_s;
+    b.srcAccessMask       = src_a;
+    b.dstStageMask        = dst_s;
+    b.dstAccessMask       = dst_a;
+    b.oldLayout           = old_l;
+    b.newLayout           = new_l;
+    b.srcQueueFamilyIndex = src_qf;
+    b.dstQueueFamilyIndex = dst_qf;
+    b.image               = img;
+    b.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    VkDependencyInfo di {};
+    di.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers    = &b;
+    vkCmdPipelineBarrier2(cmd, &di);
+}
+
 } // namespace
 
 
@@ -708,6 +735,10 @@ int YuvToRgba::convert_nv12_(VkImage             dst,
     return sync_fd;
 }
 
+// VUID-VkImageCreateInfo-pNext-06811, -VkVideoBeginCodingInfoKHR-slotIndex-07245,
+// -VkImageViewCreateInfo-image-08333 still fire on NVIDIA — those originate
+// in libavutil/vulkan_video and libavcodec/vulkan_decode and are not fixable
+// from here. Switch hwaccel away from Vulkan or upgrade FFmpeg to silence.
 int YuvToRgba::convert_av_vk_frame_(const VkFrameImports& im,
                                    VkImage             dst,
                                    uint32_t            dst_w,
@@ -860,22 +891,44 @@ int YuvToRgba::convert_av_vk_frame_(const VkFrameImports& im,
         cleanup_views(); return -1;
     }
 
-    /* Acquire Y/UV from FFmpeg's queue family → ours, transition to
-     * SHADER_READ_ONLY. Single-image path emits ONE barrier on the
-     * shared VkImage (covers all planes). */
-    const uint32_t y_src_qf  = *im.y_qf_in_out;
-    const uint32_t uv_src_qf = *im.uv_qf_in_out;
-    barrier_image(cmd_, im.y_image,
-                  0, VK_ACCESS_SHADER_READ_BIT,
-                  *im.y_layout_in_out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                  y_src_qf, queue_family_);
+    /* Acquire Y/UV from FFmpeg's image. FFmpeg's vulkan hwframes pool
+     * uses VK_SHARING_MODE_CONCURRENT (we passed multiple queue families
+     * to AVVulkanDeviceContext::qf), so AVVkFrame::queue_family[i] is
+     * VK_QUEUE_FAMILY_IGNORED and no QFOT is allowed; both indices must
+     * be IGNORED then. Only when FFmpeg ran the decode on a real,
+     * different family do we record an actual ownership transfer.
+     * Synchronization with the prior vkCmdDecodeVideoKHR is established
+     * by the timeline semaphore wait at submit; we still set the
+     * barrier's srcStageMask to VIDEO_DECODE so the validation layer's
+     * per-resource hazard tracker can relate them. Single-image path
+     * emits ONE barrier on the shared VkImage (covers all planes). */
+    const uint32_t y_avvk_qf  = *im.y_qf_in_out;
+    const uint32_t uv_avvk_qf = *im.uv_qf_in_out;
+    auto qfot_pair = [this](uint32_t avvk_qf) -> std::pair<uint32_t, uint32_t> {
+        if (avvk_qf == VK_QUEUE_FAMILY_IGNORED || avvk_qf == queue_family_) {
+            return { VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED };
+        }
+        return { avvk_qf, queue_family_ };
+    };
+    // src side: cross-queue execution dep is the timeline-semaphore wait at
+    // submit (dstStage=COMPUTE_SHADER); barrier srcStage must overlap with
+    // the wait dstStage so the validator can chain "prior decode → wait →
+    // barrier → our compute". VIDEO_DECODE on this queue is meaningless
+    // (this is a compute queue) and produces a WAR hazard report.
+    // srcAccess=0: the semaphore release covers memory visibility.
+    auto [y_acq_src, y_acq_dst]   = qfot_pair(y_avvk_qf);
+    auto [uv_acq_src, uv_acq_dst] = qfot_pair(uv_avvk_qf);
+    barrier_image2(cmd_, im.y_image,
+                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                   *im.y_layout_in_out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   y_acq_src, y_acq_dst);
     if (!single_image) {
-        barrier_image(cmd_, im.uv_image,
-                      0, VK_ACCESS_SHADER_READ_BIT,
-                      *im.uv_layout_in_out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                      uv_src_qf, queue_family_);
+        barrier_image2(cmd_, im.uv_image,
+                       VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                       *im.uv_layout_in_out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       uv_acq_src, uv_acq_dst);
     }
 
     /* dst: UNDEFINED → GENERAL. */
@@ -900,20 +953,33 @@ int YuvToRgba::convert_av_vk_frame_(const VkFrameImports& im,
     const uint32_t gy = (dst_h + 7) / 8;
     vkCmdDispatch(cmd_, gx, gy, 1);
 
-    /* Release Y/UV back to FFmpeg's queue family in GENERAL layout
-     * (FFmpeg's decoder expects that on the next decode submit), and
-     * release dst to FOREIGN for the bridge consumer. */
-    barrier_image(cmd_, im.y_image,
-                  VK_ACCESS_SHADER_READ_BIT, 0,
-                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                  queue_family_, y_src_qf);
+    /* Release Y/UV back in GENERAL layout (FFmpeg's next decode submit
+     * expects that), and release dst to FOREIGN for the bridge consumer.
+     * Same QFOT rules as ACQUIRE: when AVVkFrame says IGNORED (CONCURRENT
+     * pool) we transition layout only and keep both indices IGNORED. */
+    auto [y_rel_src, y_rel_dst]   = (y_avvk_qf == VK_QUEUE_FAMILY_IGNORED
+                                     || y_avvk_qf == queue_family_)
+        ? std::pair<uint32_t, uint32_t>{ VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED }
+        : std::pair<uint32_t, uint32_t>{ queue_family_, y_avvk_qf };
+    auto [uv_rel_src, uv_rel_dst] = (uv_avvk_qf == VK_QUEUE_FAMILY_IGNORED
+                                     || uv_avvk_qf == queue_family_)
+        ? std::pair<uint32_t, uint32_t>{ VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED }
+        : std::pair<uint32_t, uint32_t>{ queue_family_, uv_avvk_qf };
+    // dst side: VIDEO_DECODE on this queue would be meaningless. The
+    // semaphore signal happens after all our cmds (sync1 vkQueueSubmit
+    // signals at ALL_COMMANDS implicitly), so dstStage=ALL_COMMANDS,
+    // dstAccess=0 just sequences the layout transition before signal.
+    barrier_image2(cmd_, im.y_image,
+                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                   y_rel_src, y_rel_dst);
     if (!single_image) {
-        barrier_image(cmd_, im.uv_image,
-                      VK_ACCESS_SHADER_READ_BIT, 0,
-                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                      queue_family_, uv_src_qf);
+        barrier_image2(cmd_, im.uv_image,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                       VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                       uv_rel_src, uv_rel_dst);
     }
     barrier_image(cmd_, dst,
                   VK_ACCESS_SHADER_WRITE_BIT, 0,
@@ -983,8 +1049,10 @@ int YuvToRgba::convert_av_vk_frame_(const VkFrameImports& im,
     *im.uv_sem_val_in_out = uv_signal_val;
     *im.y_layout_in_out   = VK_IMAGE_LAYOUT_GENERAL;
     *im.uv_layout_in_out  = VK_IMAGE_LAYOUT_GENERAL;
-    *im.y_qf_in_out       = y_src_qf;   /* released back to FFmpeg's family */
-    *im.uv_qf_in_out      = uv_src_qf;
+    // CONCURRENT pool: both stay IGNORED. Cross-family QFOT: we just
+    // released back to the family AVVkFrame had on entry — preserve it.
+    *im.y_qf_in_out       = y_avvk_qf;
+    *im.uv_qf_in_out      = uv_avvk_qf;
 
     /* Export sync_fd for the bridge. */
     VkSemaphoreGetFdInfoKHR sgfi {};
