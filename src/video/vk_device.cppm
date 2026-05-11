@@ -45,6 +45,42 @@ public:
                                         const std::string& render_node)
         -> rstd::Result<std::unique_ptr<Producer>, Error>;
 
+    // Adopt a caller-owned VkInstance/VkDevice. The returned Producer
+    // exposes them via instance() / device() etc. and feeds FFmpeg's
+    // AVVulkanDeviceContext via make_shared_vulkan_hwdevice, but does
+    // NOT destroy them in its destructor — the caller retains ownership.
+    // `enabled_inst_exts` and `enabled_dev_exts` are the extension lists
+    // the caller passed to vkCreateInstance / vkCreateDevice; they're
+    // mirrored to FFmpeg verbatim (the pointed-to char* must outlive
+    // the Producer).
+    // No staging buffer / command pool is allocated — `upload_into`
+    // returns an error on adopted Producers; this constructor is meant
+    // for shared-device decode only.
+    struct ExternalDeviceInfo {
+        VkInstance       instance;
+        VkPhysicalDevice physical_device;
+        VkDevice         device;
+        VkQueue          queue;
+        std::uint32_t    queue_family_index;
+        // Full per-family caps list — typically as wide as
+        // vkGetPhysicalDeviceQueueFamilyProperties returns. Used for
+        // AVVulkanDeviceContext::qf[]. May be empty (FFmpeg falls back
+        // to its own queue discovery).
+        std::vector<QueueFamily>     queue_families;
+        std::vector<const char*>     enabled_instance_extensions;
+        std::vector<const char*>     enabled_device_extensions;
+        std::uint32_t                api_version { 0x00403000u }; // VK_API_VERSION_1_3
+        std::uint32_t                width  { 0 };
+        std::uint32_t                height { 0 };
+        // Optional DRM render-node info (renderD12X). drm_render_fd is
+        // adopted (closed on Producer destruction) if >= 0.
+        int                          drm_render_fd { -1 };
+        std::uint32_t                drm_render_major { 0 };
+        std::uint32_t                drm_render_minor { 0 };
+    };
+    static auto from_external(ExternalDeviceInfo info)
+        -> rstd::Result<std::unique_ptr<Producer>, Error>;
+
     VkInstance       instance() const         { return instance_; }
     VkPhysicalDevice physical_device() const  { return phys_; }
     VkDevice         device() const           { return device_; }
@@ -116,6 +152,12 @@ private:
     std::vector<QueueFamily> queue_families_;
 
     PFN_vkGetSemaphoreFdKHR vkGetSemaphoreFdKHR_ { nullptr };
+
+    /* When true, ~Producer destroys the VkInstance/VkDevice and the
+     * staging/command-pool/fence/semaphore resources it allocated. When
+     * false (from_external path) only resources we created are torn
+     * down; instance/device belong to the caller. */
+    bool             owns_device_ { true };
 };
 
 } // namespace wavsen::video

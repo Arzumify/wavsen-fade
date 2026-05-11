@@ -62,9 +62,9 @@ Producer::~Producer() {
         if (signal_sem_)          vkDestroySemaphore(device_, signal_sem_, nullptr);
         if (done_fence_)          vkDestroyFence(device_, done_fence_, nullptr);
         if (cmd_pool_)            vkDestroyCommandPool(device_, cmd_pool_, nullptr);
-        vkDestroyDevice(device_, nullptr);
+        if (owns_device_)         vkDestroyDevice(device_, nullptr);
     }
-    if (instance_)         vkDestroyInstance(instance_, nullptr);
+    if (owns_device_ && instance_) vkDestroyInstance(instance_, nullptr);
     if (drm_render_fd_ >= 0) ::close(drm_render_fd_);
 }
 
@@ -83,6 +83,38 @@ auto Producer::create_with_render_node(uint32_t width, uint32_t height,
     auto p = build_(width, height, &render_node, &err);
     if (!p) return rstd::Err(std::move(err));
     return rstd::Ok(std::move(p));
+}
+
+auto Producer::from_external(ExternalDeviceInfo info)
+    -> rstd::Result<std::unique_ptr<Producer>, Error> {
+    if (!info.instance || !info.physical_device || !info.device || !info.queue) {
+        return rstd::Err(Error { "Producer::from_external: missing handle(s)" });
+    }
+    auto self = std::unique_ptr<Producer>(new Producer());
+    self->owns_device_ = false;
+    self->instance_    = info.instance;
+    self->phys_        = info.physical_device;
+    self->device_      = info.device;
+    self->queue_       = info.queue;
+    self->queue_family_ = info.queue_family_index;
+    self->width_       = info.width;
+    self->height_      = info.height;
+    self->instance_api_version_ = info.api_version;
+    self->enabled_inst_exts_ = std::move(info.enabled_instance_extensions);
+    self->enabled_dev_exts_  = std::move(info.enabled_device_extensions);
+    self->queue_families_    = std::move(info.queue_families);
+    /* Caller-supplied DRM fd is adopted (Producer destructor closes it
+     * when >= 0). Passing -1 simply means "we don't have one"; FFmpeg's
+     * vaapi path doesn't need it when running on the shared Vulkan
+     * device. */
+    self->drm_render_fd_     = info.drm_render_fd;
+    self->drm_render_major_  = info.drm_render_major;
+    self->drm_render_minor_  = info.drm_render_minor;
+    /* Probe vkGetSemaphoreFdKHR — required by the bridge upload path,
+     * but adopted Producers don't expose upload_into. Best-effort. */
+    self->vkGetSemaphoreFdKHR_ = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
+        vkGetDeviceProcAddr(self->device_, "vkGetSemaphoreFdKHR"));
+    return rstd::Ok(std::move(self));
 }
 
 std::unique_ptr<Producer>
@@ -469,6 +501,11 @@ auto Producer::upload_into(VkImage target, uint32_t target_w, uint32_t target_h,
 int Producer::upload_into_(VkImage target, uint32_t target_w, uint32_t target_h,
                            const uint8_t* data, std::size_t size, Error* err) {
     if (target == VK_NULL_HANDLE) { fail(err, "upload_into: target VkImage is null"); return -1; }
+    if (staging_buf_ == VK_NULL_HANDLE) {
+        fail(err, "upload_into: Producer has no staging buffer "
+                  "(from_external Producers are decode-only)");
+        return -1;
+    }
     if (size != staging_size_)    { fail(err, "upload_into: size mismatch"); return -1; }
 
     if (fence_pending_) {

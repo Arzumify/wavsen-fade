@@ -1,3 +1,11 @@
+module;
+
+/* Global module fragment: POSIX errno + stdio constants used by the
+ * AVIO shim helpers below. C++20 modules don't import macros, so these
+ * have to come from #include. */
+#include <cerrno>
+#include <cstdio>
+
 module wavsen.video.video_decoder;
 
 import rstd.cppstd;
@@ -227,6 +235,14 @@ std::string av_err_str(int rc) {
 } // namespace
 
 struct VideoDecoder::State {
+    /* Custom-IO source (open_from_stream path). Declared first so it
+     * outlives every libav object that holds avio_ctx — the destructor
+     * resets `fmt` and frees `avio_ctx` explicitly before the implicit
+     * member destructors run, then `input_stream` is destroyed last as
+     * the implicit destructions unwind in reverse declaration order. */
+    std::unique_ptr<IInputStream> input_stream;
+    AVIOContext*                  avio_ctx { nullptr };
+
     FmtCtxPtr     fmt;
     CodecCtxPtr   cctx;
     PacketPtr     pkt;
@@ -247,6 +263,19 @@ struct VideoDecoder::State {
     int           video_idx   { -1 };
     AVRational    stream_tb   { 0, 1 };
     bool          flushing    { false };
+
+    ~State() {
+        /* Tear down libavformat first so it stops invoking our avio
+         * callbacks. Then free the avio buffer + context. input_stream
+         * is released last (implicit destruction) — it's still alive
+         * here in case avformat_close_input touches pb. */
+        fmt.reset();
+        if (avio_ctx) {
+            std::uint8_t* buf = avio_ctx->buffer;
+            avio_context_free(&avio_ctx);
+            if (buf) av_free(buf);
+        }
+    }
 };
 
 namespace {
@@ -312,6 +341,21 @@ bool probe_native_impl(const std::string& path,
 }
 } // namespace (probe_native_impl)
 
+/* AVIOContext shims that bounce libavformat IO into an IInputStream. */
+namespace {
+int avio_read_shim(void* opaque, uint8_t* buf, int buf_size) {
+    auto* s = static_cast<IInputStream*>(opaque);
+    int n = s->read(buf, buf_size);
+    if (n == 0) return AVERROR_EOF;
+    if (n < 0)  return AVERROR(EIO);
+    return n;
+}
+int64_t avio_seek_shim(void* opaque, int64_t offset, int whence) {
+    auto* s = static_cast<IInputStream*>(opaque);
+    return s->seek(offset, whence);
+}
+} // namespace
+
 VideoDecoder::~VideoDecoder() = default;
 
 auto VideoDecoder::probe_native(const std::string& path)
@@ -328,7 +372,8 @@ auto VideoDecoder::open(const std::string& path,
                         uint32_t target_w, uint32_t target_h, bool loop)
     -> rstd::Result<std::unique_ptr<VideoDecoder>, Error> {
     Error err;
-    auto  p = build_internal(path, target_w, target_h, loop,
+    auto  p = build_internal(InputSpec { path, nullptr },
+                             target_w, target_h, loop,
                              /*pre_built_hwdev=*/nullptr,
                              /*requested_kind=*/FrameKind::Sw, &err);
     if (!p) return rstd::Err(std::move(err));
@@ -373,7 +418,8 @@ auto VideoDecoder::open_with_vk(const std::string& path,
             continue;
         }
         Error err;
-        auto  p = build_internal(path, target_w, target_h, loop, hwd, kind, &err);
+        auto  p = build_internal(InputSpec { path, nullptr },
+                                 target_w, target_h, loop, hwd, kind, &err);
         if (p) return rstd::Ok(std::move(p));
         rstd::log::info("VideoDecoder: hwaccel {} build_internal failed: {} — trying next",
                         order[i] == HwAccel::Vulkan ? "vulkan" : "vaapi",
@@ -383,7 +429,90 @@ auto VideoDecoder::open_with_vk(const std::string& path,
 
     /* Final fallback: pure sw decode. */
     Error err;
-    auto  p = build_internal(path, target_w, target_h, loop,
+    auto  p = build_internal(InputSpec { path, nullptr },
+                             target_w, target_h, loop,
+                             /*pre_built_hwdev=*/nullptr,
+                             /*requested_kind=*/FrameKind::Sw, &err);
+    if (!p) return rstd::Err(std::move(err));
+    return rstd::Ok(std::move(p));
+}
+
+auto VideoDecoder::open_from_stream(std::unique_ptr<IInputStream> stream,
+                                    uint32_t target_w, uint32_t target_h, bool loop,
+                                    const Producer* vk,
+                                    const OpenOpts& opts)
+    -> rstd::Result<std::unique_ptr<VideoDecoder>, Error> {
+    if (!stream) return rstd::Err(Error { "open_from_stream: stream is null" });
+
+    /* Sw / vaapi-only fast path (no shared Vulkan hwdev). */
+    if (!vk) {
+        Error err;
+        auto  p = build_internal(InputSpec { {}, std::move(stream) },
+                                 target_w, target_h, loop,
+                                 /*pre_built_hwdev=*/nullptr,
+                                 /*requested_kind=*/FrameKind::Sw, &err);
+        if (!p) return rstd::Err(std::move(err));
+        return rstd::Ok(std::move(p));
+    }
+
+    /* Shared Vulkan path: mirror open_with_vk's trial loop but without
+     * the path-based fallbacks. Stream ownership transfers into the
+     * first successful build_internal — if every trial fails, ownership
+     * lands in the final sw-decode attempt. We move once per attempt
+     * since AVFormatContext consumes the avio. */
+    HwAccel order[2] = { HwAccel::None, HwAccel::None };
+    int     n_order  = 0;
+    switch (opts.hwaccel) {
+    case HwAccel::Auto:   order[0] = HwAccel::Vulkan; order[1] = HwAccel::Vaapi; n_order = 2; break;
+    case HwAccel::Vulkan: order[0] = HwAccel::Vulkan; n_order = 1; break;
+    case HwAccel::Vaapi:  order[0] = HwAccel::Vaapi;  n_order = 1; break;
+    case HwAccel::None:   n_order = 0; break;
+    }
+
+    /* The stream can only be opened once: each failed build_internal
+     * consumes the AVFormatContext but returns ownership of the avio
+     * context untouched. We need a fresh stream for retries — but
+     * IInputStream has a seek API; the simplest is to seek back to
+     * offset 0 on the *same* stream between attempts. */
+    for (int i = 0; i < n_order; ++i) {
+        Error        local_err;
+        AVBufferRef* hwd = nullptr;
+        FrameKind    kind = FrameKind::Sw;
+        if (order[i] == HwAccel::Vulkan) {
+            hwd  = make_shared_vulkan_hwdevice(*vk, &local_err);
+            kind = FrameKind::VulkanShared;
+        } else if (order[i] == HwAccel::Vaapi) {
+#if defined(WAVSEN_HAS_VAAPI)
+            hwd  = make_vaapi_hwdevice(opts.render_node, &local_err);
+            kind = FrameKind::VaapiDrm;
+#else
+            local_err.message = "wavsen built without VAAPI support";
+#endif
+        }
+        if (!hwd) {
+            rstd::log::info("VideoDecoder: hwaccel attempt {} skipped: {}",
+                            order[i] == HwAccel::Vulkan ? "vulkan" : "vaapi",
+                            local_err.message.c_str());
+            continue;
+        }
+        Error err;
+        /* Rewind so the next probe sees a complete container. */
+        stream->seek(0, SEEK_SET);
+        auto  p = build_internal(InputSpec { {}, std::move(stream) },
+                                 target_w, target_h, loop, hwd, kind, &err);
+        if (p) return rstd::Ok(std::move(p));
+        rstd::log::info("VideoDecoder: hwaccel {} build_internal failed: {} — trying next",
+                        order[i] == HwAccel::Vulkan ? "vulkan" : "vaapi",
+                        err.message.c_str());
+        /* On failure the InputSpec was destroyed inside build_internal,
+         * taking the stream with it. We can't retry — log and fall out. */
+        return rstd::Err(std::move(err));
+    }
+
+    /* No hwaccel attempted (HwAccel::None) → straight sw decode. */
+    Error err;
+    auto  p = build_internal(InputSpec { {}, std::move(stream) },
+                             target_w, target_h, loop,
                              /*pre_built_hwdev=*/nullptr,
                              /*requested_kind=*/FrameKind::Sw, &err);
     if (!p) return rstd::Err(std::move(err));
@@ -391,7 +520,7 @@ auto VideoDecoder::open_with_vk(const std::string& path,
 }
 
 std::unique_ptr<VideoDecoder>
-VideoDecoder::build_internal(const std::string& path,
+VideoDecoder::build_internal(InputSpec input,
                              uint32_t target_w, uint32_t target_h,
                              bool loop, void* pre_built_hwdev_v,
                              FrameKind requested_kind,
@@ -399,6 +528,11 @@ VideoDecoder::build_internal(const std::string& path,
     AVBufferRef* pre_built_hwdev = static_cast<AVBufferRef*>(pre_built_hwdev_v);
     if (target_w == 0 || target_h == 0) {
         fail(err, "target dimensions must be non-zero");
+        if (pre_built_hwdev) av_buffer_unref(&pre_built_hwdev);
+        return nullptr;
+    }
+    if (input.path.empty() && !input.stream) {
+        fail(err, "InputSpec: neither path nor stream provided");
         if (pre_built_hwdev) av_buffer_unref(&pre_built_hwdev);
         return nullptr;
     }
@@ -420,10 +554,46 @@ VideoDecoder::build_internal(const std::string& path,
     if (pre_built_hwdev) self->st_->hwd.reset(pre_built_hwdev);
 
     AVFormatContext* raw_fmt = nullptr;
-    if (int rc = avformat_open_input(&raw_fmt, path.c_str(), nullptr, nullptr);
-        rc < 0) {
-        fail(err, "avformat_open_input: " + av_err_str(rc));
-        return nullptr;
+    if (input.stream) {
+        /* Custom-IO open: install an AVIOContext that calls back into
+         * the caller's IInputStream. fmt->pb must outlive fmt — see
+         * State's explicit destructor for the cleanup ordering. */
+        self->st_->input_stream = std::move(input.stream);
+        constexpr int kAvioBuf = 4096;
+        auto* avio_buf = static_cast<unsigned char*>(av_malloc(kAvioBuf));
+        if (!avio_buf) {
+            fail(err, "av_malloc(avio buffer) failed");
+            return nullptr;
+        }
+        self->st_->avio_ctx = avio_alloc_context(
+            avio_buf, kAvioBuf, /*write_flag=*/0,
+            /*opaque=*/self->st_->input_stream.get(),
+            &avio_read_shim, /*write_packet=*/nullptr, &avio_seek_shim);
+        if (!self->st_->avio_ctx) {
+            av_free(avio_buf);
+            fail(err, "avio_alloc_context failed");
+            return nullptr;
+        }
+        raw_fmt = avformat_alloc_context();
+        if (!raw_fmt) {
+            fail(err, "avformat_alloc_context failed");
+            return nullptr;
+        }
+        raw_fmt->pb    = self->st_->avio_ctx;
+        raw_fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+        if (int rc = avformat_open_input(&raw_fmt, nullptr, nullptr, nullptr);
+            rc < 0) {
+            /* On failure avformat_open_input frees raw_fmt for us, but
+             * leaves avio_ctx alone — State's destructor will free it. */
+            fail(err, "avformat_open_input(stream): " + av_err_str(rc));
+            return nullptr;
+        }
+    } else {
+        if (int rc = avformat_open_input(&raw_fmt, input.path.c_str(),
+                                         nullptr, nullptr); rc < 0) {
+            fail(err, "avformat_open_input: " + av_err_str(rc));
+            return nullptr;
+        }
     }
     self->st_->fmt.reset(raw_fmt);
 

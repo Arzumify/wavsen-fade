@@ -70,6 +70,21 @@ struct OpenOpts {
     std::string render_node;
 };
 
+// Caller-supplied byte source for stream-based decoder construction.
+// Maps onto libavformat's AVIOContext callbacks. Methods are invoked
+// from the decoder thread; implementations don't need internal locks.
+// Lifetime: VideoDecoder takes ownership and destroys after close.
+struct IInputStream {
+    virtual ~IInputStream() = default;
+    // Read up to `size` bytes into `buf`. Return bytes read; 0 = EOF;
+    // negative = error (mapped to AVERROR_EOF / AVERROR(EIO)).
+    virtual int     read(std::uint8_t* buf, int size) = 0;
+    // `whence` mirrors libavformat: SEEK_SET / SEEK_CUR / SEEK_END, and
+    // AVSEEK_SIZE (0x10000) which must return the total stream size.
+    // Negative return on failure.
+    virtual std::int64_t seek(std::int64_t offset, int whence) = 0;
+};
+
 // Which pump method the caller should drive for the next frame. Each
 // frame is decoded into exactly one of the three concrete views.
 enum class FrameKind {
@@ -146,6 +161,17 @@ public:
                              const OpenOpts& opts = {})
         -> rstd::Result<std::unique_ptr<VideoDecoder>, Error>;
 
+    // Stream-based open. Wraps `stream` as an AVIOContext and feeds it to
+    // libavformat. `vk` is optional; when non-null behaves like
+    // open_with_vk (full hwaccel chain), when null behaves like open
+    // (sw decode only). The stream is destroyed when the returned
+    // VideoDecoder is destroyed.
+    static auto open_from_stream(std::unique_ptr<IInputStream> stream,
+                                 std::uint32_t target_w, std::uint32_t target_h, bool loop,
+                                 const Producer* vk = nullptr,
+                                 const OpenOpts& opts = {})
+        -> rstd::Result<std::unique_ptr<VideoDecoder>, Error>;
+
     ~VideoDecoder();
     VideoDecoder(const VideoDecoder&)            = delete;
     VideoDecoder& operator=(const VideoDecoder&) = delete;
@@ -169,11 +195,20 @@ public:
 private:
     VideoDecoder() = default;
 
+    // Internal input descriptor: exactly one of `path` (file-based, used
+    // by open / open_with_vk) or `stream` (AVIOContext-based, used by
+    // open_from_stream) is populated. `stream` is moved into State on
+    // success so it outlives the libavformat context.
+    struct InputSpec {
+        std::string                    path;
+        std::unique_ptr<IInputStream>  stream;
+    };
+
     // Internal builder. `pre_built_hwdev` is AVBufferRef* type-erased to
     // void*; `requested_kind` records the hw mode the trial loop picked
     // so the per-frame pump knows which side-data to extract.
     static std::unique_ptr<VideoDecoder>
-    build_internal(const std::string& path,
+    build_internal(InputSpec input,
                    std::uint32_t target_w, std::uint32_t target_h,
                    bool loop, void* pre_built_hwdev,
                    FrameKind requested_kind,
