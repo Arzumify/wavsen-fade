@@ -678,13 +678,28 @@ VideoDecoder::build_internal(InputSpec input,
     /* Force get_format to run by feeding one probe packet — h264
      * (and most modern codecs) only invoke get_format on first frame
      * decode, not at avcodec_open2 time. We need to know whether the
-     * vulkan hwaccel actually accepted the codec NOW, before
-     * returning, so the caller drives the right pump method.
+     * hwaccel actually accepted the codec NOW, before returning, so
+     * the trial loop can fall through to the next backend / sw on
+     * mismatch instead of dying at first frame.
      *
-     * Read frames until we hit a video packet, send it, then seek
-     * back and flush so the user's first next_*_frame call starts
-     * from the beginning as if nothing happened. */
+     * The probe is also necessary for VAAPI specifically: when libva
+     * rejects a profile (e.g. h264 profile 77), FFmpeg's get_format
+     * silently falls back to a sw pix_fmt — avcodec_open2 still
+     * succeeds, but the per-frame pump would then see a sw frame and
+     * abort with "decoder produced non-VAAPI frame".
+     *
+     * Read frames until we hit a video packet, send it, then seek back
+     * and flush so the user's first next_*_frame starts from byte 0. */
+    AVPixelFormat want_pix_fmt = AV_PIX_FMT_NONE;
+    const char*   hw_label     = nullptr;
     if (requested_kind == FrameKind::VulkanShared) {
+        want_pix_fmt = AV_PIX_FMT_VULKAN;
+        hw_label     = "vulkan";
+    } else if (requested_kind == FrameKind::VaapiDrm) {
+        want_pix_fmt = AV_PIX_FMT_VAAPI;
+        hw_label     = "vaapi";
+    }
+    if (want_pix_fmt != AV_PIX_FMT_NONE) {
         AVPacket* probe = av_packet_alloc();
         if (probe) {
             bool got_video = false;
@@ -706,13 +721,13 @@ VideoDecoder::build_internal(InputSpec input,
             }
         }
 
-        if (self->st_->cctx->pix_fmt != AV_PIX_FMT_VULKAN) {
-            /* Return failure so open_with_vk's trial loop falls through
-             * to the final sw-decode attempt with FrameKind::Sw, which
-             * picks libdav1d for AV1. Just flipping kind_ here would
-             * leave cctx bound to the hw-only native decoder and trip
-             * ENOSYS on the first send_packet. */
-            fail(err, std::string("vulkan hwaccel rejected codec ") +
+        if (self->st_->cctx->pix_fmt != want_pix_fmt) {
+            /* Return failure so the trial loop in open_with_vk /
+             * open_from_stream falls through to the next backend (or
+             * final sw fallback, which picks libdav1d for AV1). Just
+             * flipping kind_ would leave cctx bound to a hw-only native
+             * decoder and trip ENOSYS / wrong-format on first frame. */
+            fail(err, std::string(hw_label) + " hwaccel rejected codec " +
                       avcodec_get_name(par->codec_id) +
                       " (probe pix_fmt=" +
                       av_get_pix_fmt_name(self->st_->cctx->pix_fmt) + ")");
