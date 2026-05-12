@@ -437,17 +437,25 @@ auto VideoDecoder::open_with_vk(const std::string& path,
     return rstd::Ok(std::move(p));
 }
 
-auto VideoDecoder::open_from_stream(std::unique_ptr<IInputStream> stream,
+auto VideoDecoder::open_from_stream(InputStreamFactory make_stream,
                                     uint32_t target_w, uint32_t target_h, bool loop,
                                     const Producer* vk,
                                     const OpenOpts& opts)
     -> rstd::Result<std::unique_ptr<VideoDecoder>, Error> {
-    if (!stream) return rstd::Err(Error { "open_from_stream: stream is null" });
+    if (!make_stream) return rstd::Err(Error { "open_from_stream: factory is null" });
+
+    auto fresh_stream = [&](Error* err) -> std::unique_ptr<IInputStream> {
+        auto s = make_stream();
+        if (!s) fail(err, "open_from_stream: factory returned null");
+        return s;
+    };
 
     /* Sw / vaapi-only fast path (no shared Vulkan hwdev). */
     if (!vk) {
         Error err;
-        auto  p = build_internal(InputSpec { {}, std::move(stream) },
+        auto  s = fresh_stream(&err);
+        if (!s) return rstd::Err(std::move(err));
+        auto  p = build_internal(InputSpec { {}, std::move(s) },
                                  target_w, target_h, loop,
                                  /*pre_built_hwdev=*/nullptr,
                                  /*requested_kind=*/FrameKind::Sw, &err);
@@ -455,11 +463,9 @@ auto VideoDecoder::open_from_stream(std::unique_ptr<IInputStream> stream,
         return rstd::Ok(std::move(p));
     }
 
-    /* Shared Vulkan path: mirror open_with_vk's trial loop but without
-     * the path-based fallbacks. Stream ownership transfers into the
-     * first successful build_internal — if every trial fails, ownership
-     * lands in the final sw-decode attempt. We move once per attempt
-     * since AVFormatContext consumes the avio. */
+    /* Shared Vulkan path: mirror open_with_vk's trial loop. Each trial
+     * gets a fresh IInputStream from the factory — build_internal
+     * consumes it, and on failure State's destructor cleans up. */
     HwAccel order[2] = { HwAccel::None, HwAccel::None };
     int     n_order  = 0;
     switch (opts.hwaccel) {
@@ -469,11 +475,6 @@ auto VideoDecoder::open_from_stream(std::unique_ptr<IInputStream> stream,
     case HwAccel::None:   n_order = 0; break;
     }
 
-    /* The stream can only be opened once: each failed build_internal
-     * consumes the AVFormatContext but returns ownership of the avio
-     * context untouched. We need a fresh stream for retries — but
-     * IInputStream has a seek API; the simplest is to seek back to
-     * offset 0 on the *same* stream between attempts. */
     for (int i = 0; i < n_order; ++i) {
         Error        local_err;
         AVBufferRef* hwd = nullptr;
@@ -496,22 +497,25 @@ auto VideoDecoder::open_from_stream(std::unique_ptr<IInputStream> stream,
             continue;
         }
         Error err;
-        /* Rewind so the next probe sees a complete container. */
-        stream->seek(0, SEEK_SET);
-        auto  p = build_internal(InputSpec { {}, std::move(stream) },
+        auto  s = fresh_stream(&err);
+        if (!s) {
+            av_buffer_unref(&hwd);
+            return rstd::Err(std::move(err));
+        }
+        auto  p = build_internal(InputSpec { {}, std::move(s) },
                                  target_w, target_h, loop, hwd, kind, &err);
         if (p) return rstd::Ok(std::move(p));
         rstd::log::info("VideoDecoder: hwaccel {} build_internal failed: {} — trying next",
                         order[i] == HwAccel::Vulkan ? "vulkan" : "vaapi",
                         err.message.c_str());
-        /* On failure the InputSpec was destroyed inside build_internal,
-         * taking the stream with it. We can't retry — log and fall out. */
-        return rstd::Err(std::move(err));
+        /* build_internal already unref'd `hwd` via State on failure. */
     }
 
-    /* No hwaccel attempted (HwAccel::None) → straight sw decode. */
+    /* Final sw fallback — also covers HwAccel::None (n_order == 0). */
     Error err;
-    auto  p = build_internal(InputSpec { {}, std::move(stream) },
+    auto  s = fresh_stream(&err);
+    if (!s) return rstd::Err(std::move(err));
+    auto  p = build_internal(InputSpec { {}, std::move(s) },
                              target_w, target_h, loop,
                              /*pre_built_hwdev=*/nullptr,
                              /*requested_kind=*/FrameKind::Sw, &err);
@@ -610,7 +614,15 @@ VideoDecoder::build_internal(InputSpec input,
     AVCodecParameters*  par = st->codecpar;
     self->st_->stream_tb = st->time_base;
 
-    const AVCodec* dec = avcodec_find_decoder(par->codec_id);
+    /* FFmpeg's native `av1` decoder has no software path — it's a
+     * parser + hwaccel dispatcher and returns ENOSYS on send_packet when
+     * no hardware accelerator picked up the stream. Prefer libdav1d for
+     * the pure-sw case so disabling hwdec actually works on AV1. */
+    const AVCodec* dec = nullptr;
+    if (par->codec_id == AV_CODEC_ID_AV1 && requested_kind == FrameKind::Sw) {
+        dec = avcodec_find_decoder_by_name("libdav1d");
+    }
+    if (!dec) dec = avcodec_find_decoder(par->codec_id);
     if (!dec) {
         fail(err, std::string("no decoder for codec ") + avcodec_get_name(par->codec_id));
         return nullptr;
@@ -695,11 +707,16 @@ VideoDecoder::build_internal(InputSpec input,
         }
 
         if (self->st_->cctx->pix_fmt != AV_PIX_FMT_VULKAN) {
-            rstd::log::warn(
-                "VideoDecoder: vulkan hwaccel rejected the stream "
-                "(pix_fmt={} after probe); decoder downgraded to sw.",
-                av_get_pix_fmt_name(self->st_->cctx->pix_fmt));
-            self->kind_ = FrameKind::Sw;
+            /* Return failure so open_with_vk's trial loop falls through
+             * to the final sw-decode attempt with FrameKind::Sw, which
+             * picks libdav1d for AV1. Just flipping kind_ here would
+             * leave cctx bound to the hw-only native decoder and trip
+             * ENOSYS on the first send_packet. */
+            fail(err, std::string("vulkan hwaccel rejected codec ") +
+                      avcodec_get_name(par->codec_id) +
+                      " (probe pix_fmt=" +
+                      av_get_pix_fmt_name(self->st_->cctx->pix_fmt) + ")");
+            return nullptr;
         }
     }
 

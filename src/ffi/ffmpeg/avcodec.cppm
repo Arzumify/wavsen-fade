@@ -18,6 +18,7 @@ using ::AVPacket;
 using ::avcodec_alloc_context3;
 using ::avcodec_default_get_format;
 using ::avcodec_find_decoder;
+using ::avcodec_find_decoder_by_name;
 using ::avcodec_flush_buffers;
 using ::avcodec_free_context;
 using ::avcodec_get_hw_frames_parameters;

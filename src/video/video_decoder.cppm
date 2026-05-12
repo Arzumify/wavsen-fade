@@ -85,6 +85,11 @@ struct IInputStream {
     virtual std::int64_t seek(std::int64_t offset, int whence) = 0;
 };
 
+// Hands out a fresh IInputStream per call (cursor at 0). open_from_stream
+// invokes this once per hwaccel trial so each attempt sees a pristine
+// libavformat probe without depending on a working seek on a shared stream.
+using InputStreamFactory = std::function<std::unique_ptr<IInputStream>()>;
+
 // Which pump method the caller should drive for the next frame. Each
 // frame is decoded into exactly one of the three concrete views.
 enum class FrameKind {
@@ -161,12 +166,14 @@ public:
                              const OpenOpts& opts = {})
         -> rstd::Result<std::unique_ptr<VideoDecoder>, Error>;
 
-    // Stream-based open. Wraps `stream` as an AVIOContext and feeds it to
-    // libavformat. `vk` is optional; when non-null behaves like
-    // open_with_vk (full hwaccel chain), when null behaves like open
-    // (sw decode only). The stream is destroyed when the returned
+    // Stream-based open. Wraps a fresh IInputStream from `make_stream` as
+    // an AVIOContext and feeds it to libavformat. `vk` is optional; when
+    // non-null behaves like open_with_vk (full hwaccel chain), when null
+    // behaves like open (sw decode only). `make_stream` may be invoked
+    // multiple times — once per hwaccel trial plus once for the final sw
+    // fallback. The surviving stream is destroyed when the returned
     // VideoDecoder is destroyed.
-    static auto open_from_stream(std::unique_ptr<IInputStream> stream,
+    static auto open_from_stream(InputStreamFactory make_stream,
                                  std::uint32_t target_w, std::uint32_t target_h, bool loop,
                                  const Producer* vk = nullptr,
                                  const OpenOpts& opts = {})
