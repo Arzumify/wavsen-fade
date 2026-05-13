@@ -1,9 +1,3 @@
-module;
-
-#include <fcntl.h>
-#include <unistd.h>
-#include <errno.h>
-
 module wavsen.audio.byte_stream;
 
 import rstd.cppstd;
@@ -13,29 +7,30 @@ namespace wavsen::audio {
 
 using rstd::io::SeekFrom;
 using rstd::io::error::Error;
+namespace libc = rstd::sys::libc;
 
 auto PosixFile::open(const std::string& path)
     -> rstd::io::Result<std::unique_ptr<PosixFile>>
 {
-    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    int fd = libc::open(path.c_str(), libc::O_RDONLY | libc::O_CLOEXEC);
     if (fd < 0) {
-        return rstd::Err(Error::from_raw_os_error(errno));
+        return rstd::Err(Error::from_raw_os_error(libc::errno()));
     }
     return rstd::Ok(std::unique_ptr<PosixFile>(new PosixFile(fd)));
 }
 
 PosixFile::~PosixFile() {
-    if (fd_ >= 0) ::close(fd_);
+    if (fd_ >= 0) libc::close(fd_);
 }
 
 auto PosixFile::read(rstd::u8* buf, rstd::usize len)
     -> rstd::io::Result<rstd::usize>
 {
     while (true) {
-        auto n = ::read(fd_, buf, len);
+        auto n = libc::read(fd_, buf, len);
         if (n >= 0) return rstd::Ok(static_cast<rstd::usize>(n));
-        if (errno == EINTR) continue;
-        return rstd::Err(Error::from_raw_os_error(errno));
+        if (libc::errno() == libc::EINTR) continue;
+        return rstd::Err(Error::from_raw_os_error(libc::errno()));
     }
 }
 
@@ -44,13 +39,13 @@ auto PosixFile::seek(SeekFrom pos)
 {
     int whence;
     switch (pos.which) {
-    case SeekFrom::Which::Start:   whence = SEEK_SET; break;
-    case SeekFrom::Which::Current: whence = SEEK_CUR; break;
-    case SeekFrom::Which::End:     whence = SEEK_END; break;
+    case SeekFrom::Which::Start:   whence = libc::SEEK_SET; break;
+    case SeekFrom::Which::Current: whence = libc::SEEK_CUR; break;
+    case SeekFrom::Which::End:     whence = libc::SEEK_END; break;
     }
-    auto off = ::lseek(fd_, static_cast<off_t>(pos.offset), whence);
+    auto off = libc::lseek(fd_, static_cast<libc::off_t>(pos.offset), whence);
     if (off < 0) {
-        return rstd::Err(Error::from_raw_os_error(errno));
+        return rstd::Err(Error::from_raw_os_error(libc::errno()));
     }
     return rstd::Ok(static_cast<rstd::u64>(off));
 }

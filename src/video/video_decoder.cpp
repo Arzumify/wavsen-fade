@@ -1,11 +1,3 @@
-module;
-
-/* Global module fragment: POSIX errno + stdio constants used by the
- * AVIO shim helpers below. C++20 modules don't import macros, so these
- * have to come from #include. */
-#include <cerrno>
-#include <cstdio>
-
 module wavsen.video.video_decoder;
 
 import rstd.cppstd;
@@ -347,7 +339,7 @@ int avio_read_shim(void* opaque, uint8_t* buf, int buf_size) {
     auto* s = static_cast<IInputStream*>(opaque);
     int n = s->read(buf, buf_size);
     if (n == 0) return AVERROR_EOF;
-    if (n < 0)  return AVERROR(EIO);
+    if (n < 0)  return AVERROR(rstd::sys::libc::EIO);
     return n;
 }
 int64_t avio_seek_shim(void* opaque, int64_t offset, int whence) {
@@ -799,7 +791,7 @@ int VideoDecoder::next_vk_frame_(VkFrameView& out, Error* err) {
             }
             return 1;
         }
-        if (rc != AVERROR(EAGAIN)) {
+        if (rc != AVERROR(rstd::sys::libc::EAGAIN)) {
             fail(err, "avcodec_receive_frame: " + av_err_str(rc));
             return -1;
         }
@@ -821,7 +813,7 @@ int VideoDecoder::next_vk_frame_(VkFrameView& out, Error* err) {
         }
         rc = avcodec_send_packet(st.cctx.get(), st.pkt.get());
         av_packet_unref(st.pkt.get());
-        if (rc < 0 && rc != AVERROR(EAGAIN)) {
+        if (rc < 0 && rc != AVERROR(rstd::sys::libc::EAGAIN)) {
             fail(err, "avcodec_send_packet: " + av_err_str(rc));
             return -1;
         }
@@ -913,7 +905,7 @@ int VideoDecoder::next_drm_frame_(DrmFrameView& out, Error* err) {
             }
             return 1;
         }
-        if (rc != AVERROR(EAGAIN)) {
+        if (rc != AVERROR(rstd::sys::libc::EAGAIN)) {
             fail(err, "avcodec_receive_frame: " + av_err_str(rc));
             return -1;
         }
@@ -935,7 +927,7 @@ int VideoDecoder::next_drm_frame_(DrmFrameView& out, Error* err) {
         }
         rc = avcodec_send_packet(st.cctx.get(), st.pkt.get());
         av_packet_unref(st.pkt.get());
-        if (rc < 0 && rc != AVERROR(EAGAIN)) {
+        if (rc < 0 && rc != AVERROR(rstd::sys::libc::EAGAIN)) {
             fail(err, "avcodec_send_packet: " + av_err_str(rc));
             return -1;
         }
@@ -1029,7 +1021,7 @@ int VideoDecoder::next_frame_(Nv12Frame& out, Error* err) {
             }
             return 1;
         }
-        if (rc != AVERROR(EAGAIN)) {
+        if (rc != AVERROR(rstd::sys::libc::EAGAIN)) {
             fail(err, "avcodec_receive_frame: " + av_err_str(rc));
             return -1;
         }
@@ -1052,7 +1044,7 @@ int VideoDecoder::next_frame_(Nv12Frame& out, Error* err) {
         }
         rc = avcodec_send_packet(st.cctx.get(), st.pkt.get());
         av_packet_unref(st.pkt.get());
-        if (rc < 0 && rc != AVERROR(EAGAIN)) {
+        if (rc < 0 && rc != AVERROR(rstd::sys::libc::EAGAIN)) {
             fail(err, "avcodec_send_packet: " + av_err_str(rc));
             return -1;
         }

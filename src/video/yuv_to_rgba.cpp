@@ -1,9 +1,5 @@
 module;
 
-#include <cstdint>             // uint32_t (used by nv12_to_rgba.spv.h) + UINT32_MAX
-#include <cstring>             // std::strerror (DRM_PRIME import error path)
-#include <cerrno>              // errno (dup of dma-buf fd)
-#include <unistd.h>            // ::dup, ::close (dma-buf ownership transfer to Vulkan)
 /* convert_drm_prime_ touches a wide slice of Vulkan: external memory FD
  * import, image plane memory binding, DRM modifier image creation. The
  * wavsen::ffi::vulkan module exports only a curated subset; pull the
@@ -1181,7 +1177,7 @@ int YuvToRgba::convert_drm_prime_(const DrmFrameView& drm,
         if (drm_image)  vkDestroyImage(device_, drm_image, nullptr);
         for (int i = 0; i < 2; ++i) {
             if (plane_mem[i]) vkFreeMemory(device_, plane_mem[i], nullptr);
-            if (dup_fds[i] >= 0) ::close(dup_fds[i]);
+            if (dup_fds[i] >= 0) rstd::sys::libc::close(dup_fds[i]);
         }
     };
 
@@ -1228,9 +1224,9 @@ int YuvToRgba::convert_drm_prime_(const DrmFrameView& drm,
     auto import_plane = [&](int plane_idx, uint32_t obj_idx,
                             VkImageAspectFlagBits aspect) -> bool {
         const int src_fd = drm.objects[obj_idx].fd;
-        const int dfd    = ::dup(src_fd);
+        const int dfd    = rstd::sys::libc::dup(src_fd);
         if (dfd < 0) {
-            fail(err, std::string("dup(dma_buf): ") + std::strerror(errno));
+            fail(err, std::string("dup(dma_buf): ") + std::strerror(rstd::sys::libc::errno()));
             return false;
         }
         dup_fds[plane_idx] = dfd;

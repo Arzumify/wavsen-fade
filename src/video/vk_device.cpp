@@ -1,13 +1,3 @@
-module;
-
-#include <cstring>      // std::strerror
-#include <cerrno>       // errno
-#include <cstdint>      // UINT32_MAX
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/sysmacros.h>
-#include <unistd.h>
-
 module wavsen.video.vk_device;
 
 import rstd.cppstd;
@@ -65,7 +55,7 @@ Producer::~Producer() {
         if (owns_device_)         vkDestroyDevice(device_, nullptr);
     }
     if (owns_device_ && instance_) vkDestroyInstance(instance_, nullptr);
-    if (drm_render_fd_ >= 0) ::close(drm_render_fd_);
+    if (drm_render_fd_ >= 0) rstd::sys::libc::close(drm_render_fd_);
 }
 
 auto Producer::create(uint32_t width, uint32_t height)
@@ -175,13 +165,13 @@ Producer::build_(uint32_t width, uint32_t height,
 
     /* Iter 4: when `render_node` is set, only the device whose DRM
      * render major:minor matches the requested path is acceptable. */
-    bool      pinning  = !render_node.empty();
-    dev_t     want_rdev = 0;
+    bool                 pinning  = !render_node.empty();
+    rstd::sys::libc::dev_t want_rdev = 0;
     if (pinning) {
-        struct stat st {};
-        if (::stat(render_node.c_str(), &st) != 0) {
+        rstd::sys::libc::stat_t st {};
+        if (rstd::sys::libc::stat(render_node.c_str(), &st) != 0) {
             fail(err, std::string("Producer: stat(") + render_node + ") failed: " +
-                       std::strerror(errno));
+                       std::strerror(rstd::sys::libc::errno()));
             return nullptr;
         }
         want_rdev = st.st_rdev;
@@ -210,8 +200,9 @@ Producer::build_(uint32_t width, uint32_t height,
             props.pNext = &drm;
             vkGetPhysicalDeviceProperties2_(pd, &props);
             if (!drm.hasRender) continue;
-            const dev_t pd_rdev = makedev(static_cast<unsigned>(drm.renderMajor),
-                                          static_cast<unsigned>(drm.renderMinor));
+            const rstd::sys::libc::dev_t pd_rdev =
+                rstd::sys::libc::makedev(static_cast<unsigned>(drm.renderMajor),
+                                         static_cast<unsigned>(drm.renderMinor));
             if (pd_rdev != want_rdev) continue;
         }
 
@@ -382,7 +373,8 @@ Producer::build_(uint32_t width, uint32_t height,
         for (int i = 128; i < 192; ++i) {
             char path[64];
             std::snprintf(path, sizeof(path), "/dev/dri/renderD%d", i);
-            int fd = ::open(path, O_RDWR | O_CLOEXEC);
+            int fd = rstd::sys::libc::open(path,
+                                           rstd::sys::libc::O_RDWR | rstd::sys::libc::O_CLOEXEC);
             if (fd >= 0) {
                 self->drm_render_fd_ = fd;
                 break;
@@ -449,7 +441,7 @@ Producer::build_(uint32_t width, uint32_t height,
     vkGetBufferMemoryRequirements(self->device_, self->staging_buf_, &bmr);
     VkPhysicalDeviceMemoryProperties mprops {};
     vkGetPhysicalDeviceMemoryProperties(self->phys_, &mprops);
-    uint32_t host_type = UINT32_MAX;
+    uint32_t host_type = rstd::u32_::MAX;
     for (uint32_t i = 0; i < mprops.memoryTypeCount; ++i) {
         const auto pf = mprops.memoryTypes[i].propertyFlags;
         if ((bmr.memoryTypeBits & (1u << i))
@@ -459,7 +451,7 @@ Producer::build_(uint32_t width, uint32_t height,
             break;
         }
     }
-    if (host_type == UINT32_MAX) {
+    if (host_type == rstd::u32_::MAX) {
         fail(err, "no HOST_VISIBLE|COHERENT memory type for staging");
         return nullptr;
     }

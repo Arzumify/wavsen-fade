@@ -1,7 +1,3 @@
-module;
-
-#include <cstdio>  // SEEK_SET / SEEK_CUR macros (preprocessor-only, can't be modulised)
-
 module wavsen.audio.file;
 
 import rstd.cppstd;
@@ -34,9 +30,9 @@ int avio_read_cb(void* opaque, std::uint8_t* buf, int sz) {
 std::int64_t avio_seek_cb(void* opaque, std::int64_t off, int whence) {
     auto* s = static_cast<IByteStream*>(opaque);
     if (whence == AVSEEK_SIZE) return -1;
-    rstd::io::SeekFrom from = (whence == SEEK_SET)
+    rstd::io::SeekFrom from = (whence == rstd::sys::libc::SEEK_SET)
         ? rstd::io::SeekFrom::from_start(static_cast<rstd::u64>(off))
-        : (whence == SEEK_CUR
+        : (whence == rstd::sys::libc::SEEK_CUR
             ? rstd::io::SeekFrom::from_current(off)
             : rstd::io::SeekFrom::from_end(off));
     auto r = s->seek(from);

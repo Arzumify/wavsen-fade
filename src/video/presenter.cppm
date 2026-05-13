@@ -1,6 +1,3 @@
-module;
-#include <cmath>  // std::isnan — function macro not exported via rstd.cppstd
-
 export module wavsen.video.presenter;
 
 import rstd.cppstd;
