@@ -82,6 +82,7 @@ struct NullHandle {
 };
 }
 #undef VK_NULL_HANDLE
+#undef VK_MAKE_VERSION
 
 export module vulkan;
 
@@ -120,6 +121,11 @@ inline constexpr const char* VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME = _wv_vk_ext:
 inline constexpr const char* VK_KHR_SWAPCHAIN_EXTENSION_NAME = _wv_vk_ext::k_VK_KHR_SWAPCHAIN_EXTENSION_NAME;
 
 inline constexpr _wv_vk::NullHandle VK_NULL_HANDLE {};
+
+inline constexpr std::uint32_t VK_MAKE_VERSION(std::uint32_t major, std::uint32_t minor,
+                                               std::uint32_t patch) {
+    return (major << 22) | (minor << 12) | patch;
+}
 
 // ---- handle types, struct types, enums, flags ----
 
@@ -196,6 +202,7 @@ using ::VkImageAspectFlags;
 using ::VkImageBlit;
 using ::VkImageCopy;
 using ::VkImageCreateInfo;
+using ::VkImageDrmFormatModifierExplicitCreateInfoEXT;
 using ::VkImageDrmFormatModifierPropertiesEXT;
 using ::VkImageLayout;
 using ::VkImageMemoryBarrier;
@@ -210,12 +217,15 @@ using ::VkImageView;
 using ::VkImageViewCreateInfo;
 using ::VkImageViewType;
 using ::VkIndexType;
+using ::VkImportMemoryFdInfoKHR;
 using ::VkInstance;
 using ::VkInstanceCreateInfo;
 using ::VkLayerProperties;
 using ::VkLogicOp;
 using ::VkMemoryAllocateInfo;
 using ::VkMemoryBarrier;
+using ::VkMemoryDedicatedAllocateInfo;
+using ::VkMemoryFdPropertiesKHR;
 using ::VkMemoryGetFdInfoKHR;
 using ::VkMemoryPropertyFlags;
 using ::VkMemoryRequirements;
@@ -327,6 +337,7 @@ using ::VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 using ::VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
 using ::VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
 using ::VK_COLORSPACE_SRGB_NONLINEAR_KHR;
+using ::VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
 using ::VK_COLOR_COMPONENT_A_BIT;
 using ::VK_COLOR_COMPONENT_B_BIT;
 using ::VK_COLOR_COMPONENT_G_BIT;
@@ -360,6 +371,7 @@ using ::VK_ERROR_FORMAT_NOT_SUPPORTED;
 using ::VK_ERROR_INCOMPATIBLE_DRIVER;
 using ::VK_ERROR_INITIALIZATION_FAILED;
 using ::VK_ERROR_LAYER_NOT_PRESENT;
+using ::VK_ERROR_OUT_OF_DATE_KHR;
 using ::VK_ERROR_OUT_OF_DEVICE_MEMORY;
 using ::VK_ERROR_OUT_OF_HOST_MEMORY;
 using ::VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
@@ -452,10 +464,14 @@ using ::VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
 using ::VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
 using ::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
 using ::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+using ::VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
 using ::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
 using ::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+using ::VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
 using ::VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
 using ::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+using ::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+using ::VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
 using ::VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
 using ::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT;
 using ::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -495,6 +511,7 @@ using ::VK_VERTEX_INPUT_RATE_VERTEX;
 
 // ---- functions (loadable directly when not using VK_NO_PROTOTYPES) ----
 
+using ::vkAcquireNextImageKHR;
 using ::vkAllocateCommandBuffers;
 using ::vkAllocateDescriptorSets;
 using ::vkAllocateMemory;
@@ -503,7 +520,10 @@ using ::vkBindBufferMemory;
 using ::vkBindImageMemory;
 using ::vkCmdBindDescriptorSets;
 using ::vkCmdBindPipeline;
+using ::vkCmdBlitImage;
+using ::vkCmdClearColorImage;
 using ::vkCmdCopyBufferToImage;
+using ::vkCmdCopyImage;
 using ::vkCmdDispatch;
 using ::vkCmdPipelineBarrier;
 using ::vkCmdPushConstants;
@@ -521,6 +541,7 @@ using ::vkCreatePipelineLayout;
 using ::vkCreateSampler;
 using ::vkCreateSemaphore;
 using ::vkCreateShaderModule;
+using ::vkCreateSwapchainKHR;
 using ::vkDestroyBuffer;
 using ::vkDestroyCommandPool;
 using ::vkDestroyDescriptorPool;
@@ -535,6 +556,8 @@ using ::vkDestroyPipelineLayout;
 using ::vkDestroySampler;
 using ::vkDestroySemaphore;
 using ::vkDestroyShaderModule;
+using ::vkDestroySurfaceKHR;
+using ::vkDestroySwapchainKHR;
 using ::vkDeviceWaitIdle;
 using ::vkEndCommandBuffer;
 using ::vkEnumerateDeviceExtensionProperties;
@@ -545,11 +568,17 @@ using ::vkGetDeviceProcAddr;
 using ::vkGetDeviceQueue;
 using ::vkGetImageMemoryRequirements;
 using ::vkGetInstanceProcAddr;
+using ::vkGetMemoryFdPropertiesKHR;
 using ::vkGetPhysicalDeviceFeatures2;
 using ::vkGetPhysicalDeviceMemoryProperties;
 using ::vkGetPhysicalDeviceProperties2;
 using ::vkGetPhysicalDeviceQueueFamilyProperties;
+using ::vkGetPhysicalDeviceSurfaceCapabilitiesKHR;
+using ::vkGetPhysicalDeviceSurfaceFormatsKHR;
+using ::vkGetPhysicalDeviceSurfaceSupportKHR;
+using ::vkGetSwapchainImagesKHR;
 using ::vkMapMemory;
+using ::vkQueuePresentKHR;
 using ::vkQueueSubmit;
 using ::vkResetCommandBuffer;
 using ::vkResetFences;
@@ -668,6 +697,7 @@ using ::PFN_vkGetImageMemoryRequirements;
 using ::PFN_vkGetImageSubresourceLayout;
 using ::PFN_vkGetInstanceProcAddr;
 using ::PFN_vkGetMemoryFdKHR;
+using ::PFN_vkGetMemoryFdPropertiesKHR;
 using ::PFN_vkGetPhysicalDeviceFeatures2;
 using ::PFN_vkGetPhysicalDeviceFeatures2KHR;
 using ::PFN_vkGetPhysicalDeviceFormatProperties;
