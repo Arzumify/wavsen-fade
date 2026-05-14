@@ -1,18 +1,18 @@
 export module wavsen.audio.core;
 
 import rstd.cppstd;
-import cubeb;
+import pipewire;
 
 export namespace wavsen::audio {
 
-// Negotiated stream format — wavsen always asks cubeb for f32 interleaved.
+// Negotiated stream format — wavsen always asks PipeWire for f32 interleaved.
 struct DeviceDesc {
     std::uint32_t channels;
     std::uint32_t sample_rate;
 };
 
 // Pulled by the audio thread to fill an output buffer. Implementations
-// must NOT block (cubeb's audio thread is realtime-ish). `frames` is the
+// must NOT block (the PipeWire data thread is realtime). `frames` is the
 // number of interleaved frames to write into `dst`.
 class IPullChannel {
 public:
@@ -21,16 +21,16 @@ public:
     virtual void pass_desc(const DeviceDesc&)                               = 0;
 };
 
-class CubebDevice {
+class AudioDevice {
 public:
-    CubebDevice();
-    ~CubebDevice();
-    CubebDevice(const CubebDevice&)            = delete;
-    CubebDevice& operator=(const CubebDevice&) = delete;
+    AudioDevice();
+    ~AudioDevice();
+    AudioDevice(const AudioDevice&)            = delete;
+    AudioDevice& operator=(const AudioDevice&) = delete;
 
     auto init() -> bool;
     void uninit();
-    auto is_inited() const -> bool { return ctx_ != nullptr && stream_ != nullptr; }
+    auto is_inited() const -> bool { return loop_ != nullptr && stream_ != nullptr; }
 
     void start();
     void stop();
@@ -45,18 +45,20 @@ public:
 
     auto desc() const -> DeviceDesc { return desc_; }
 
-    // Frames the audio device has actually played back since the cubeb
-    // stream was created. Used by AvPlayer as the master clock for A/V
-    // sync. Returns 0 before init() / on failure.
+    // Frames the audio device has actually played back since the stream
+    // was created. Used by AvPlayer as the master clock for A/V sync.
+    // Returns 0 before init() / on query failure / before primed.
     auto stream_position_frames() const -> std::uint64_t;
 
 private:
-    static long data_cb(::cubeb_stream*, void* user, const void* in, void* out, long nframes);
-    static void state_cb(::cubeb_stream*, void* user, ::cubeb_state state);
+    static void on_process(void* user);
+    static void on_state_changed(void* user, ::pw_stream_state old,
+                                 ::pw_stream_state state, const char* error);
 
-    ::cubeb*        ctx_    = nullptr;
-    ::cubeb_stream* stream_ = nullptr;
-    DeviceDesc      desc_ {};
+    ::pw_thread_loop* loop_   = nullptr;
+    ::pw_stream*      stream_ = nullptr;
+    ::spa_hook        stream_listener_ {};
+    DeviceDesc        desc_ {};
 
     std::mutex                                 channels_mu_;
     std::vector<std::unique_ptr<IPullChannel>> channels_;

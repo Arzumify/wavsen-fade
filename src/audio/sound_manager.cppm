@@ -29,9 +29,9 @@ public:
     virtual void set_listener_position(float /*x*/, float /*y*/, float /*z*/) {}
 };
 
-// Owns the cubeb output device and mounted streams. Mixing happens in the
-// audio thread via cubeb's data callback. Mute / volume are atomic so UI
-// threads can poke them without locks.
+// Owns the output audio device and mounted streams. Mixing happens in the
+// audio thread via the device's data callback. Mute / volume are atomic
+// so UI threads can poke them without locks.
 class SoundManager {
 public:
     SoundManager();

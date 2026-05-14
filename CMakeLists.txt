@@ -9,6 +9,11 @@ pkg_check_modules(WAVSEN_SWRESAMPLE           IMPORTED_TARGET libswresample>=3)
 # itself; libva pkg-config is presence-checked so the build also succeeds
 # against an FFmpeg compiled without --enable-vaapi.
 pkg_check_modules(WAVSEN_LIBVA                IMPORTED_TARGET libva libva-drm)
+pkg_check_modules(WAVSEN_LIBPIPEWIRE  REQUIRED IMPORTED_TARGET libpipewire-0.3)
+# libpipewire's Cflags inject -fno-strict-overflow / -fno-strict-aliasing
+# which trip C++20 module PCM config checks against modules (rstd.cppstd
+# etc.) built without them. Keep the include dirs + link lib, drop the flags.
+set_property(TARGET PkgConfig::WAVSEN_LIBPIPEWIRE PROPERTY INTERFACE_COMPILE_OPTIONS "")
 find_package(Vulkan REQUIRED)
 
 
@@ -19,7 +24,7 @@ find_package(Vulkan REQUIRED)
 # ---------------------------------------------------------------------------
 add_subdirectory(src/ffi/ffmpeg)
 add_subdirectory(src/ffi/vulkan)
-add_subdirectory(src/ffi/cubeb)
+add_subdirectory(src/ffi/pipewire)
 
 
 add_library(wavsen_decode STATIC)
@@ -122,7 +127,7 @@ target_compile_options(wavsen_audio PRIVATE
 target_sources(wavsen_audio
     PUBLIC FILE_SET CXX_MODULES FILES
         src/audio/byte_stream.cppm
-        src/audio/cubeb_device.cppm
+        src/audio/audio_device.cppm
         src/audio/sound_manager.cppm
         src/audio/stream_decoder.cppm
         src/audio/av_player.cppm
@@ -131,7 +136,7 @@ target_sources(wavsen_audio
 )
 target_sources(wavsen_audio PRIVATE
     src/audio/byte_stream.cpp
-    src/audio/cubeb_device.cpp
+    src/audio/audio_device.cpp
     src/audio/stream_decoder.cpp
     src/audio/sound_manager.cpp
     src/audio/av_player.cpp
@@ -142,6 +147,6 @@ target_link_libraries(wavsen_audio
         rstd::rstd
         rstd.cppstd
         wavsen::ffi::ffmpeg
-        wavsen::ffi::cubeb
+        wavsen::ffi::pipewire
 )
 set_target_properties(wavsen_audio PROPERTIES CXX_SCAN_FOR_MODULES ON)

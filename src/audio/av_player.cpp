@@ -4,7 +4,7 @@ import rstd.cppstd;
 import rstd;
 import rstd.log;
 import wavsen.audio.byte_stream;
-import wavsen.audio.core;          // CubebDevice, IPullChannel, DeviceDesc
+import wavsen.audio.core;          // AudioDevice, IPullChannel, DeviceDesc
 import wavsen.audio.file;          // StreamDecoder
 
 namespace wavsen::audio {
@@ -61,9 +61,9 @@ private:
 
 class AvPlayer::Impl {
 public:
-    CubebDevice    device;
+    AudioDevice    device;
     StreamDecoder* decoder_ptr = nullptr;  // owned by AvPullChannel via decoder_storage
-    // The decoder must outlive the cubeb stream (which calls into it).
+    // The decoder must outlive the audio stream (which calls into it).
     // Owned via unique_ptr so the AvPullChannel can hold a stable pointer.
     std::unique_ptr<StreamDecoder> decoder_storage;
 
@@ -83,7 +83,7 @@ auto AvPlayer::open(std::shared_ptr<IByteStream> src)
     auto p = std::unique_ptr<AvPlayer>(new AvPlayer());
 
     if (!p->impl_->device.init()) {
-        return rstd::Err(AvPlayerError{ "cubeb device init failed" });
+        return rstd::Err(AvPlayerError{ "audio device init failed" });
     }
 
     const auto desc = p->impl_->device.desc();

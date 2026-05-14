@@ -9,7 +9,7 @@ namespace wavsen::audio {
 
 namespace {
 
-// Adapter exposing a SoundStream to CubebDevice's IPullChannel interface.
+// Adapter exposing a SoundStream to AudioDevice's IPullChannel interface.
 class StreamPullChannel : public IPullChannel {
 public:
     explicit StreamPullChannel(std::unique_ptr<SoundStream> ss)
@@ -30,7 +30,7 @@ private:
 
 class SoundManager::Impl {
 public:
-    CubebDevice device;
+    AudioDevice device;
 };
 
 SoundManager::SoundManager() : impl_(std::make_unique<Impl>()) {}
