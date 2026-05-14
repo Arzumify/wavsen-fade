@@ -8,13 +8,13 @@ module;
  * curated subset for downstream consumers. */
 #include <vulkan/vulkan.h>
 
-export module wavsen.video.yuv_to_rgba;
+export module wavsen.video:yuv_to_rgba;
 
 import rstd.cppstd;
 import rstd;
 import vulkan;
-import wavsen.video.vk_device;        // Error
-import wavsen.video.video_decoder;    // DrmFrameView
+import :vk_device;        // Error
+import :video_decoder;    // DrmFrameView
 
 export namespace wavsen::video {
 

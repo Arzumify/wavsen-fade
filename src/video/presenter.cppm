@@ -1,4 +1,4 @@
-export module wavsen.video.presenter;
+export module wavsen.video:presenter;
 
 import rstd.cppstd;
 

@@ -1,9 +1,9 @@
-export module wavsen.audio.file;
+export module wavsen.audio:file;
 
 import rstd.cppstd;
-import wavsen.audio.byte_stream;  // IByteStream
-import wavsen.audio.core;         // DeviceDesc
-import wavsen.audio.mixer;        // SoundStream (for make_stream factory)
+import :byte_stream;  // IByteStream
+import :core;         // DeviceDesc
+import :mixer;        // SoundStream (for make_stream factory)
 
 export namespace wavsen::audio {
 

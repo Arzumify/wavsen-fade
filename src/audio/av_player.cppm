@@ -1,8 +1,8 @@
-export module wavsen.audio.av_sync;
+export module wavsen.audio:av_sync;
 
 import rstd.cppstd;
 import rstd;
-import wavsen.audio.byte_stream;  // IByteStream
+import :byte_stream;  // IByteStream
 
 export namespace wavsen::audio {
 

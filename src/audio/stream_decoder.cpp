@@ -1,11 +1,12 @@
-module wavsen.audio.file;
+module wavsen.audio;
 
 import rstd.cppstd;
 import rstd;
 import rstd.log;
-import wavsen.audio.byte_stream;  // IByteStream
-import wavsen.audio.core;         // DeviceDesc
-import wavsen.audio.mixer;        // SoundStream
+import :byte_stream;  // IByteStream
+import :core;         // DeviceDesc
+import :mixer;        // SoundStream
+import :file;
 import avutil;
 import avcodec;
 import avformat;

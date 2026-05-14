@@ -7,12 +7,13 @@ module;
 #include <vulkan/vulkan.h>
 #include "nv12_to_rgba.spv.h"  // generated at build time by glslangValidator
 
-module wavsen.video.yuv_to_rgba;
+module wavsen.video;
 
 import rstd.cppstd;
 import rstd;
 import vulkan;
-import wavsen.video.vk_device;
+import :vk_device;
+import :yuv_to_rgba;
 
 namespace wavsen::video {
 

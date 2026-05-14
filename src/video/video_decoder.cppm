@@ -1,9 +1,9 @@
-export module wavsen.video.video_decoder;
+export module wavsen.video:video_decoder;
 
 import rstd.cppstd;
 import rstd;
 import vulkan;
-import wavsen.video.vk_device;        // Error, Producer
+import :vk_device;        // Error, Producer
 
 export namespace wavsen::video {
 

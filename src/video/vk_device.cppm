@@ -1,4 +1,4 @@
-export module wavsen.video.vk_device;
+export module wavsen.video:vk_device;
 
 import rstd.cppstd;
 import rstd;

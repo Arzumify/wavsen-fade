@@ -1,8 +1,9 @@
-module wavsen.video.vk_device;
+module wavsen.video;
 
 import rstd.cppstd;
 import rstd;
 import vulkan;
+import :vk_device;
 
 namespace wavsen::video {
 

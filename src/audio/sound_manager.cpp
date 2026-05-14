@@ -1,9 +1,10 @@
-module wavsen.audio.mixer;
+module wavsen.audio;
 
 import rstd.cppstd;
 import rstd;
 import rstd.log;
-import wavsen.audio.core;
+import :core;
+import :mixer;
 
 namespace wavsen::audio {
 

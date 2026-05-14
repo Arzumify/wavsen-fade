@@ -4,12 +4,13 @@ module;
 #include <spa/param/audio/format-utils.h>
 #include <spa/utils/result.h>
 
-module wavsen.audio.core;
+module wavsen.audio;
 
 import rstd.cppstd;
 import rstd;
 import rstd.log;
 import pipewire;
+import :core;
 
 namespace wavsen::audio {
 

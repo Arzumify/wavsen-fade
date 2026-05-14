@@ -1,4 +1,4 @@
-export module wavsen.audio.byte_stream;
+export module wavsen.audio:byte_stream;
 
 import rstd.cppstd;
 import rstd;        // pulls in rstd::io::Result / SeekFrom / error::Error transitively

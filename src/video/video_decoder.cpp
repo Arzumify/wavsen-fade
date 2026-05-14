@@ -1,10 +1,11 @@
-module wavsen.video.video_decoder;
+module wavsen.video;
 
 import rstd.cppstd;
 import rstd;
 import rstd.log;
 import vulkan;
-import wavsen.video.vk_device;
+import :vk_device;
+import :video_decoder;
 import avutil;
 import avcodec;
 import avformat;

@@ -1,11 +1,12 @@
-module wavsen.audio.av_sync;
+module wavsen.audio;
 
 import rstd.cppstd;
 import rstd;
 import rstd.log;
-import wavsen.audio.byte_stream;
-import wavsen.audio.core;          // AudioDevice, IPullChannel, DeviceDesc
-import wavsen.audio.file;          // StreamDecoder
+import :byte_stream;
+import :core;          // AudioDevice, IPullChannel, DeviceDesc
+import :file;          // StreamDecoder
+import :av_sync;
 
 namespace wavsen::audio {
 

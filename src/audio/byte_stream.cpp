@@ -1,7 +1,8 @@
-module wavsen.audio.byte_stream;
+module wavsen.audio;
 
 import rstd.cppstd;
 import rstd;
+import :byte_stream;
 
 namespace wavsen::audio {
 
