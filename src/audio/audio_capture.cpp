@@ -28,14 +28,26 @@ constexpr std::uint32_t kDefaultRate     = 48000;
 constexpr std::uint32_t kDefaultChannels = 2;
 constexpr std::uint32_t kQuantum         = 1024;
 
-constexpr std::size_t kNumBins = 16;
+constexpr std::size_t kNumBins  = 64;
+constexpr std::size_t kHalfFft  = 512;
 
 // Log-spaced edges over the FFT half-spectrum (bins 1..N/2). Index k
-// covers FFT bins [edges[k], edges[k+1]). Hand-picked to roughly match
-// musical octave bands at 48 kHz / 1024-pt resolution (~47 Hz/bin).
-constexpr std::array<std::size_t, kNumBins + 1> kBandEdges = {
-    1, 2, 3, 5, 7, 10, 14, 20, 28, 40, 56, 80, 113, 160, 226, 320, 512
-};
+// covers FFT bins [edges[k], edges[k+1]). Generated once at startup;
+// each band edge grows geometrically with a floor of +1 so consecutive
+// bands never collide at the low end where bin spacing is tight.
+const std::array<std::size_t, kNumBins + 1> kBandEdges = [] {
+    std::array<std::size_t, kNumBins + 1> e {};
+    e[0] = 1;
+    for (std::size_t k = 1; k <= kNumBins; ++k) {
+        const double t = std::pow(static_cast<double>(kHalfFft),
+                                  static_cast<double>(k) / static_cast<double>(kNumBins));
+        std::size_t next = static_cast<std::size_t>(std::ceil(t));
+        if (next <= e[k - 1]) next = e[k - 1] + 1;
+        if (next > kHalfFft)  next = kHalfFft;
+        e[k] = next;
+    }
+    return e;
+}();
 
 // In-place radix-2 Cooley-Tukey FFT (forward).
 void fft_inplace(std::complex<float>* data, std::size_t n) {

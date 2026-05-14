@@ -9,7 +9,7 @@ export namespace wavsen::audio {
 // peaks slightly above for loud transients. Layout/size matches owe's
 // `FrameInputs::audio_average`.
 struct AudioSpectrum {
-    std::array<float, 16> bins {};
+    std::array<float, 64> bins {};
 };
 
 // Taps the default sink's monitor via a PipeWire INPUT stream with
@@ -44,7 +44,7 @@ private:
 
     // Ring of f32 mono samples, sized to the FFT window.
     static constexpr std::size_t kFftSize  = 1024;
-    static constexpr std::size_t kNumBins  = 16;
+    static constexpr std::size_t kNumBins  = 64;
 
     std::array<float, kFftSize> ring_ {};
     std::size_t                 ring_head_     = 0;
