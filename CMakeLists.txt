@@ -131,7 +131,8 @@ target_sources(wavsen_audio
         src/audio/sound_manager.cppm
         src/audio/stream_decoder.cppm
         src/audio/av_player.cppm
-        # aggregator must come last (depends on the four above)
+        src/audio/audio_capture.cppm
+        # aggregator must come last (depends on the partitions above)
         src/audio/audio.cppm
 )
 target_sources(wavsen_audio PRIVATE
@@ -140,6 +141,7 @@ target_sources(wavsen_audio PRIVATE
     src/audio/stream_decoder.cpp
     src/audio/sound_manager.cpp
     src/audio/av_player.cpp
+    src/audio/audio_capture.cpp
 )
 
 target_link_libraries(wavsen_audio
