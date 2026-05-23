@@ -3,6 +3,7 @@ module;
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
 
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <numbers>
@@ -300,6 +301,9 @@ void AudioCapture::on_process(void* user) {
         self->smoothed_[k] = v;
         out.bins[k]        = v;
     }
+    out.publish_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
 
     // Publish via seqlock — fetch_add by 1 toggles parity each call.
     self->seq_.fetch_add(1, std::memory_order_release);

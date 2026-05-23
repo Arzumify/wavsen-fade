@@ -5,11 +5,15 @@ import pipewire;
 
 export namespace wavsen::audio {
 
-// 16-bin log-spaced magnitude spectrum, EMA-smoothed. Roughly 0..1 with
+// 64-bin log-spaced magnitude spectrum, EMA-smoothed. Roughly 0..1 with
 // peaks slightly above for loud transients. Layout/size matches owe's
-// `FrameInputs::audio_average`.
+// `FrameInputs::audio_average`. `publish_ms` is a steady_clock timestamp
+// (ms since epoch) of the last RT-side update, used by readers to detect
+// stale snapshots (pipewire stopped delivering, sink disconnected, ...).
+// Zero means "never primed".
 struct AudioSpectrum {
     std::array<float, 64> bins {};
+    std::int64_t publish_ms { 0 };
 };
 
 // Taps the default sink's monitor via a PipeWire INPUT stream with
