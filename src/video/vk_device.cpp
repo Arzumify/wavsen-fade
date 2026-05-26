@@ -1,3 +1,5 @@
+module;
+#include <cstdio>
 module wavsen.video;
 
 import rstd.cppstd;
