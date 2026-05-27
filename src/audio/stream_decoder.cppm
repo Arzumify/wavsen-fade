@@ -25,7 +25,7 @@ public:
     auto open(std::shared_ptr<IByteStream> src, const DeviceDesc& target) -> bool;
 
     // Update target descriptor (channels / sample rate). Caller invokes
-    // this after the cubeb device negotiates a different format than what
+    // this after the audio device negotiates a different format than what
     // was originally requested.
     void retarget(const DeviceDesc& target);
 

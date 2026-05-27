@@ -9,11 +9,24 @@ pkg_check_modules(WAVSEN_SWRESAMPLE           IMPORTED_TARGET libswresample>=3)
 # itself; libva pkg-config is presence-checked so the build also succeeds
 # against an FFmpeg compiled without --enable-vaapi.
 pkg_check_modules(WAVSEN_LIBVA                IMPORTED_TARGET libva libva-drm)
-pkg_check_modules(WAVSEN_LIBPIPEWIRE  REQUIRED IMPORTED_TARGET libpipewire-0.3)
-# libpipewire's Cflags inject -fno-strict-overflow / -fno-strict-aliasing
-# which trip C++20 module PCM config checks against modules (rstd.cppstd
-# etc.) built without them. Keep the include dirs + link lib, drop the flags.
-set_property(TARGET PkgConfig::WAVSEN_LIBPIPEWIRE PROPERTY INTERFACE_COMPILE_OPTIONS "")
+
+set(WAVSEN_AUDIO_BACKEND "pulse" CACHE STRING
+    "Audio backend for wavsen::audio (pulse|pipewire)")
+set_property(CACHE WAVSEN_AUDIO_BACKEND PROPERTY STRINGS pulse pipewire)
+
+if(WAVSEN_AUDIO_BACKEND STREQUAL "pulse")
+    pkg_check_modules(WAVSEN_LIBPULSE REQUIRED IMPORTED_TARGET libpulse>=14.0)
+elseif(WAVSEN_AUDIO_BACKEND STREQUAL "pipewire")
+    pkg_check_modules(WAVSEN_LIBPIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
+    # libpipewire's Cflags inject -fno-strict-overflow / -fno-strict-aliasing
+    # which trip C++20 module PCM config checks against modules (rstd.cppstd
+    # etc.) built without them. Keep the include dirs + link lib, drop the flags.
+    set_property(TARGET PkgConfig::WAVSEN_LIBPIPEWIRE PROPERTY INTERFACE_COMPILE_OPTIONS "")
+else()
+    message(FATAL_ERROR
+        "WAVSEN_AUDIO_BACKEND='${WAVSEN_AUDIO_BACKEND}' is not one of: pulse pipewire")
+endif()
+
 find_package(Vulkan REQUIRED)
 
 
@@ -24,7 +37,11 @@ find_package(Vulkan REQUIRED)
 # ---------------------------------------------------------------------------
 add_subdirectory(src/ffi/ffmpeg)
 add_subdirectory(src/ffi/vulkan)
-add_subdirectory(src/ffi/pipewire)
+if(WAVSEN_AUDIO_BACKEND STREQUAL "pulse")
+    add_subdirectory(src/ffi/pulse)
+else()
+    add_subdirectory(src/ffi/pipewire)
+endif()
 
 
 add_library(wavsen_decode STATIC)
@@ -137,18 +154,31 @@ target_sources(wavsen_audio
 )
 target_sources(wavsen_audio PRIVATE
     src/audio/byte_stream.cpp
-    src/audio/audio_device.cpp
     src/audio/stream_decoder.cpp
     src/audio/sound_manager.cpp
     src/audio/av_player.cpp
-    src/audio/audio_capture.cpp
 )
+
+if(WAVSEN_AUDIO_BACKEND STREQUAL "pulse")
+    target_sources(wavsen_audio PRIVATE
+        src/audio/audio_device_pulse.cpp
+        src/audio/audio_capture_pulse.cpp
+    )
+    set(_wavsen_audio_backend_target wavsen::ffi::pulse)
+else()
+    target_sources(wavsen_audio PRIVATE
+        src/audio/audio_device_pipewire.cpp
+        src/audio/audio_capture_pipewire.cpp
+    )
+    set(_wavsen_audio_backend_target wavsen::ffi::pipewire)
+endif()
 
 target_link_libraries(wavsen_audio
     PUBLIC
         rstd::rstd
         rstd.cppstd
         wavsen::ffi::ffmpeg
-        wavsen::ffi::pipewire
+    PRIVATE
+        ${_wavsen_audio_backend_target}
 )
 set_target_properties(wavsen_audio PROPERTIES CXX_SCAN_FOR_MODULES ON)
