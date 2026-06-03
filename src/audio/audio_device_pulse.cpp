@@ -106,6 +106,13 @@ public:
         pa_stream_set_state_callback(stream_, &Impl::on_stream_state, this);
         pa_stream_set_write_callback(stream_, &Impl::on_write, this);
 
+        // Must be set before connect: the write callback can fire as soon as
+        // the stream is writable (during the READY wait below). If desc_ is
+        // still {0,0} there, on_write bails on stride==0 without ever calling
+        // pa_stream_write, and PulseAudio never re-invokes it — the stream
+        // stalls at silence for its whole lifetime.
+        desc_ = { kDefaultChannels, kDefaultRate };
+
         const auto frame_bytes = kDefaultChannels * static_cast<std::uint32_t>(sizeof(float));
         pa_buffer_attr ba {};
         ba.maxlength = static_cast<std::uint32_t>(-1);
@@ -156,8 +163,6 @@ public:
         }
 
         pa_threaded_mainloop_unlock(loop_);
-
-        desc_ = { kDefaultChannels, kDefaultRate };
 
         {
             std::lock_guard<std::mutex> lk(channels_mu_);
