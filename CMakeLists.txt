@@ -182,3 +182,20 @@ target_link_libraries(wavsen_audio
         ${_wavsen_audio_backend_target}
 )
 set_target_properties(wavsen_audio PROPERTIES CXX_SCAN_FOR_MODULES ON)
+
+option(WAVSEN_BUILD_TESTS "Build wavsen test executables" OFF)
+if(WAVSEN_BUILD_TESTS)
+    enable_testing()
+    add_executable(wavsen_audio_capture_dsp_tests
+        tests/audio_capture_dsp_tests.cpp
+    )
+    target_compile_features(wavsen_audio_capture_dsp_tests PRIVATE cxx_std_20)
+    target_compile_options(wavsen_audio_capture_dsp_tests PRIVATE
+        -Wall -Wextra -Wpedantic -Wno-missing-field-initializers
+    )
+    target_include_directories(wavsen_audio_capture_dsp_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/audio
+    )
+    add_test(NAME wavsen_audio_capture_dsp_tests
+             COMMAND wavsen_audio_capture_dsp_tests)
+endif()

@@ -180,7 +180,7 @@ public:
         for (int attempt = 0; attempt < 16; ++attempt) {
             const std::uint32_t s1 = seq_.load(std::memory_order_acquire);
             if (s1 == 0) {
-                out.bins.fill(0.0f);
+                out.clear();
                 return false;
             }
             if (s1 & 1u) continue;
@@ -192,7 +192,7 @@ public:
                 return true;
             }
         }
-        out.bins.fill(0.0f);
+        out.clear();
         return false;
     }
 
@@ -262,49 +262,43 @@ private:
 
     void ingest(const float* src, std::uint32_t n_frames, std::uint32_t channels) {
         for (std::uint32_t f = 0; f < n_frames; ++f) {
-            float sum = 0.f;
-            for (std::uint32_t c = 0; c < channels; ++c) {
-                sum += src[f * channels + c];
-            }
-            const float mono = channels > 0 ? sum / static_cast<float>(channels) : 0.f;
-            ring_[ring_head_] = mono;
-            ring_head_ = (ring_head_ + 1) % dsp::kFftSize;
+            const std::uint32_t base  = f * channels;
+            const float         left  = channels > 0 ? src[base] : 0.f;
+            const float         right = channels > 1 ? src[base + 1] : left;
+            ring_left_[ring_head_]    = left;
+            ring_right_[ring_head_]   = right;
+            ring_head_                = (ring_head_ + 1) % dsp::kFftSize;
+            if (samples_filled_ < dsp::kFftSize) ++samples_filled_;
             ++samples_since_fft_;
         }
 
-        if (samples_since_fft_ < dsp::kFftSize / 2) return;
+        if (samples_filled_ < dsp::kFftSize || samples_since_fft_ < dsp::kHopSize) return;
         samples_since_fft_ = 0;
 
-        std::array<std::complex<float>, dsp::kFftSize> buf;
+        std::array<std::complex<float>, dsp::kFftSize> buf_left;
+        std::array<std::complex<float>, dsp::kFftSize> buf_right;
         for (std::size_t i = 0; i < dsp::kFftSize; ++i) {
             const std::size_t idx = (ring_head_ + i) % dsp::kFftSize;
-            const float w = dsp::hann_window(i, dsp::kFftSize);
-            buf[i] = std::complex<float>(ring_[idx] * w, 0.f);
+            const float       w   = dsp::hann_window(i, dsp::kFftSize);
+            buf_left[i]           = std::complex<float>(ring_left_[idx] * w, 0.f);
+            buf_right[i]          = std::complex<float>(ring_right_[idx] * w, 0.f);
         }
 
-        dsp::fft_inplace(buf.data(), dsp::kFftSize);
+        dsp::fft_inplace(buf_left.data(), dsp::kFftSize);
+        dsp::fft_inplace(buf_right.data(), dsp::kFftSize);
 
-        AudioSpectrum raw {};
         const float norm = 2.0f / static_cast<float>(dsp::kFftSize);
-        for (std::size_t k = 0; k < dsp::kNumBins; ++k) {
-            const std::size_t lo = dsp::kBandEdges[k];
-            const std::size_t hi = dsp::kBandEdges[k + 1];
-            float sum = 0.f;
-            for (std::size_t i = lo; i < hi; ++i) {
-                sum += std::abs(buf[i]);
-            }
-            const float mag = sum / static_cast<float>(hi - lo) * norm;
-            raw.bins[k] = std::tanh(mag * 4.0f);
-        }
+        const auto  raw =
+            dsp::analyze_stereo_spectrum(buf_left.data(), buf_right.data(), band_layout_, norm);
+        const auto dt_sec = static_cast<float>(dsp::kHopSize) / static_cast<float>(kDefaultRate);
+        const auto bands  = dsp::smooth_spectrum(raw, smoothed_, dt_sec);
 
         AudioSpectrum out {};
         for (std::size_t k = 0; k < dsp::kNumBins; ++k) {
-            const float prev = smoothed_[k];
-            const float cur  = raw.bins[k];
-            const float a    = cur > prev ? dsp::kAlphaUp : dsp::kAlphaDown;
-            const float v    = a * cur + (1.0f - a) * prev;
-            smoothed_[k] = v;
-            out.bins[k]  = v;
+            out.left[k]    = bands.left[k];
+            out.right[k]   = bands.right[k];
+            out.average[k] = bands.average[k];
+            out.bins[k]    = bands.average[k];
         }
         out.publish_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::steady_clock::now().time_since_epoch())
@@ -321,10 +315,13 @@ private:
     std::string             default_sink_;
     bool                    server_info_done_ = false;
 
-    std::array<float, dsp::kFftSize> ring_ {};
+    std::array<float, dsp::kFftSize> ring_left_ {};
+    std::array<float, dsp::kFftSize> ring_right_ {};
     std::size_t                      ring_head_         = 0;
+    std::size_t                      samples_filled_    = 0;
     std::size_t                      samples_since_fft_ = 0;
-    std::array<float, dsp::kNumBins> smoothed_ {};
+    dsp::BandLayout                  band_layout_ { dsp::make_mel_layout(kDefaultRate) };
+    dsp::SpectrumBands               smoothed_ {};
 
     mutable std::atomic<std::uint32_t> seq_ { 0 };
     AudioSpectrum                       published_ {};
