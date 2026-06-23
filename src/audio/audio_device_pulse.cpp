@@ -1,6 +1,10 @@
 module;
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <pulse/pulseaudio.h>
+#include <shared_mutex>
 
 module wavsen.audio;
 
@@ -236,6 +240,22 @@ public:
     bool  muted()  const { return muted_.load(std::memory_order_relaxed); }
     void  set_volume(float v) { volume_.store(v, std::memory_order_relaxed); }
     void  set_muted(bool m)   { muted_.store(m,  std::memory_order_relaxed); }
+    void  start_fade_in(uint32_t fade_ms)
+    {
+        std::lock_guard<std::shared_mutex> lk(fade_info_mu_);
+        fade_info_.state = FadeIn;
+        fade_info_.start = std::chrono::steady_clock::now();
+        fade_info_.time = std::chrono::milliseconds(fade_ms);
+        fading_.store(true, std::memory_order_relaxed);
+    }
+    void  start_fade_out(uint32_t fade_ms)
+    {
+        std::lock_guard<std::shared_mutex> lk(fade_info_mu_);
+        fade_info_.state = FadeOut;
+        fade_info_.start = std::chrono::steady_clock::now();
+        fade_info_.time = std::chrono::milliseconds(fade_ms);
+        fading_.store(true, std::memory_order_relaxed);
+    }
 
     std::uint64_t stream_position_frames() const {
         if (! stream_ || ! loop_) return 0;
@@ -283,6 +303,20 @@ private:
 
             if (! self->muted_.load(std::memory_order_relaxed)) {
                 const float gain = self->volume_.load(std::memory_order_relaxed);
+                if (self->fading_.load(std::memory_order_relaxed)) {
+                    std::shared_lock<std::shared_mutex> = lk(self->fade_info_mu_);
+                    std::chrono::milliseconds difference = std::chrono::steady_clock::now() - self->fade_info_.start;
+                    float passed = static_cast<float>(difference.count()) / static_cast<float>(self->fade_info_.time.count());
+                    if (passed < 1.0) {
+                        if (self->fade_info_.state == FadeIn) {
+                            gain *= passed;
+                        } else {
+                            gain *= 1.0 - passed;
+                        }
+                    } else {
+                        self->fading_.store(false, std::memory_order_relaxed);
+                    }
+                }
 
                 std::vector<float> scratch(total_samples);
 
@@ -316,6 +350,9 @@ private:
 
     std::atomic<float> volume_ { 1.0f };
     std::atomic<bool>  muted_ { false };
+    std::shared_mutex fade_info_mu_;
+    FadeInfo fade_info_;
+    std::atomic<bool> fading_ { false };
 };
 
 AudioDevice::AudioDevice() : impl_(std::make_unique<Impl>()) {}
@@ -332,6 +369,8 @@ float AudioDevice::volume() const         { return impl_->volume(); }
 bool  AudioDevice::muted()  const         { return impl_->muted(); }
 void  AudioDevice::set_volume(float v)    { impl_->set_volume(v); }
 void  AudioDevice::set_muted(bool m)      { impl_->set_muted(m); }
+void AudioDevice::start_fade_in(uint32_t fade_ms) { impl_->start_fade_in(fade_ms); }
+void AudioDevice::start_fade_out(uint32_t fade_ms) { impl_->start_fade_out(fade_ms); }
 DeviceDesc AudioDevice::desc() const      { return impl_->desc(); }
 std::uint64_t AudioDevice::stream_position_frames() const {
     return impl_->stream_position_frames();

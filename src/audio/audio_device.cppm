@@ -20,6 +20,19 @@ public:
     virtual void pass_desc(const DeviceDesc&)                               = 0;
 };
 
+enum FadeState
+{
+    FadeIn,
+    FadeOut,
+};
+
+struct FadeInfo
+{
+    FadeState state;
+    std::chrono::time_point<std::chrono::steady_clock, std::chrono::milliseconds> start;
+    std::chrono::milliseconds time;
+};
+
 class AudioDevice {
 public:
     AudioDevice();
@@ -40,6 +53,8 @@ public:
     auto volume() const -> float;
     auto muted() const -> bool;
     void set_volume(float v);
+    void start_fade_in(uint32_t fade_ms);
+    void start_fade_out(uint32_t fade_ms);
     void set_muted(bool m);
 
     auto desc() const -> DeviceDesc;

@@ -45,6 +45,8 @@ public:
     // 0..1 linear gain. Atomic; safe from any thread.
     void set_volume(float v);
     void set_muted(bool m);
+    void start_fade_in(std::uint32_t fade_ms);
+    void start_fade_out(std::uint32_t fade_ms);
 
     // True once the decoder reached EOF *and* the device has had time
     // to drain the last enqueued frames.

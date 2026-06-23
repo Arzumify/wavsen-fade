@@ -158,6 +158,8 @@ double AvPlayer::current_time_seconds() const {
 
 void AvPlayer::set_volume(float v) { impl_->device.set_volume(v); }
 void AvPlayer::set_muted(bool m)   { impl_->device.set_muted(m); }
+void AvPlayer::start_fade_in(std::uint32_t fade_ms) { impl_->device.start_fade_in(fade_ms); }
+void AvPlayer::start_fade_out(std::uint32_t fade_ms) { impl_->device.start_fade_out(fade_ms); }
 
 bool AvPlayer::is_eof() const {
     return impl_->decoder_ptr && impl_->decoder_ptr->is_eof();
